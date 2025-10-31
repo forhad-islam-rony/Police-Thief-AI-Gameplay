@@ -326,6 +326,347 @@ class CSPDecisionMaker:
         # Default to center lane if unclear
         return 1
 
+# A* Search Algorithm for Pathfinding
+import heapq
+
+class AStarNode:
+    """
+    Node representation for A* pathfinding algorithm.
+    Each node represents a state: (lane, distance) position.
+    """
+    def __init__(self, lane, distance, g_cost, h_cost, parent=None):
+        self.lane = lane  # Lane index (0, 1, 2)
+        self.distance = distance  # Distance along the track
+        self.g_cost = g_cost  # Cost from start to this node
+        self.h_cost = h_cost  # Heuristic cost to goal
+        self.f_cost = g_cost + h_cost  # Total cost
+        self.parent = parent  # Parent node for path reconstruction
+    
+    def __lt__(self, other):
+        """Comparison for priority queue (lower f_cost = higher priority)"""
+        return self.f_cost < other.f_cost
+    
+    def __eq__(self, other):
+        """Equality check based on position"""
+        return self.lane == other.lane and abs(self.distance - other.distance) < 50
+
+class AStarPathfinder:
+    """
+    A* Pathfinding algorithm for vehicle navigation.
+    Finds optimal path considering traffic, opponents, and power-ups.
+    """
+    
+    def __init__(self, heuristic_type='manhattan'):
+        """
+        Initialize A* pathfinder.
+        
+        Args:
+            heuristic_type: 'manhattan' or 'euclidean'
+                - Manhattan: |Δlane| × LANE_WIDTH + |Δdistance| (better for structured movement)
+                - Euclidean: √((Δx)² + (Δdistance)²) (better for direct pursuit)
+        """
+        self.heuristic_type = heuristic_type
+        self.lane_positions = [
+            ROAD_X + LANE_WIDTH // 2,
+            ROAD_X + LANE_WIDTH + LANE_WIDTH // 2,
+            ROAD_X + 2 * LANE_WIDTH + LANE_WIDTH // 2
+        ]
+    
+    def manhattan_distance(self, current_lane, current_distance, goal_lane, goal_distance):
+        """
+        Manhattan distance heuristic (L1 norm).
+        Calculates distance as sum of absolute differences.
+        Better for grid-like movement (lane changes are discrete).
+        
+        Formula: |Δlane| × LANE_WIDTH + |Δdistance|
+        """
+        lane_diff = abs(current_lane - goal_lane) * LANE_WIDTH
+        distance_diff = abs(goal_distance - current_distance)
+        return lane_diff + distance_diff
+    
+    def euclidean_distance(self, current_lane, current_distance, goal_lane, goal_distance):
+        """
+        Euclidean distance heuristic (L2 norm).
+        Calculates straight-line distance between positions.
+        Better for direct pursuit and aggressive navigation.
+        
+        Formula: √((Δx)² + (Δdistance)²)
+        """
+        current_x = self.lane_positions[current_lane]
+        goal_x = self.lane_positions[goal_lane]
+        x_diff = goal_x - current_x
+        distance_diff = goal_distance - current_distance
+        return math.sqrt(x_diff**2 + distance_diff**2)
+    
+    def calculate_heuristic(self, current_lane, current_distance, goal_lane, goal_distance):
+        """Calculate heuristic based on selected type"""
+        if self.heuristic_type == 'manhattan':
+            return self.manhattan_distance(current_lane, current_distance, goal_lane, goal_distance)
+        else:  # euclidean
+            return self.euclidean_distance(current_lane, current_distance, goal_lane, goal_distance)
+    
+    def get_lane_from_x(self, x_position):
+        """Convert x position to lane index"""
+        for i, lane_x in enumerate(self.lane_positions):
+            if abs(x_position - lane_x) < LANE_WIDTH // 2:
+                return i
+        return 1  # Default to center lane
+    
+    def find_clearest_lane(self, current_distance, traffic_cars, look_ahead=600):
+        """
+        Find the lane with least traffic ahead.
+        Returns (lane_index, traffic_count, min_distance_to_traffic)
+        """
+        lane_info = []
+        
+        for lane_idx in range(3):
+            traffic_count = 0
+            min_distance = float('inf')
+            
+            for car in traffic_cars:
+                if car.lane == lane_idx:
+                    distance_to_car = car.distance - current_distance
+                    if 0 < distance_to_car < look_ahead:
+                        traffic_count += 1
+                        min_distance = min(min_distance, distance_to_car)
+            
+            lane_info.append((lane_idx, traffic_count, min_distance))
+        
+        # Sort by: fewer cars, then greater minimum distance
+        lane_info.sort(key=lambda x: (x[1], -x[2]))
+        return lane_info[0]  # Return clearest lane
+    
+    def is_position_safe(self, lane, distance, traffic_cars, opponent=None, ghost_mode=False):
+        """
+        Check if a position is safe (no collisions).
+        IMPROVED: Larger safety margins and look-ahead distance.
+        
+        Args:
+            lane: Lane index
+            distance: Distance along track
+            traffic_cars: List of traffic cars
+            opponent: Opponent vehicle (to avoid)
+            ghost_mode: If True, can pass through traffic
+        """
+        # Ghost mode allows passing through traffic
+        if ghost_mode:
+            return True
+        
+        # Check traffic car collisions with LARGER safety margin
+        for car in traffic_cars:
+            if car.lane == lane:
+                distance_diff = abs(car.distance - distance)
+                # INCREASED from 150 to 250 for better safety
+                if distance_diff < 250:  # Larger safety margin
+                    return False
+        
+        # Check opponent collision (police should avoid being ahead of thief before catching)
+        if opponent:
+            opponent_lane = self.get_lane_from_x(opponent.x)
+            if lane == opponent_lane:
+                distance_diff = abs(opponent.distance - distance)
+                if distance_diff < 150:  # Increased safety margin
+                    return False
+        
+        return True
+    
+    def calculate_path_cost(self, current_node, next_lane, next_distance, traffic_cars, 
+                           opponent=None, ghost_mode=False, is_police=False):
+        """
+        Calculate cost of moving to next position.
+        IMPROVED: Much stronger penalties for traffic proximity.
+        
+        Cost components:
+        - Distance traveled
+        - Lane change penalty (lane changes are risky)
+        - Traffic proximity penalty (HEAVILY increased)
+        - Opponent interaction (police chases, thief evades)
+        """
+        # Base cost: distance traveled
+        distance_cost = abs(next_distance - current_node.distance)
+        
+        # Lane change penalty (changing lanes is costly)
+        lane_change_cost = 0
+        if next_lane != current_node.lane:
+            lane_change_cost = 30  # Reduced slightly to allow necessary lane changes
+        
+        # IMPROVED: Much stronger traffic proximity penalty
+        traffic_penalty = 0
+        if not ghost_mode:
+            for car in traffic_cars:
+                if car.lane == next_lane:
+                    distance_diff = abs(car.distance - next_distance)
+                    
+                    # CRITICAL ZONE: Very close to traffic
+                    if distance_diff < 100:
+                        traffic_penalty += 500  # MASSIVE penalty for very close
+                    elif distance_diff < 200:
+                        traffic_penalty += 300  # Strong penalty for close
+                    elif distance_diff < 300:
+                        traffic_penalty += 150  # Medium penalty
+                    elif distance_diff < 400:
+                        traffic_penalty += 50   # Small penalty for approach
+            
+            # BONUS: Reward clear lanes (no traffic within 500 units)
+            lane_clear = True
+            for car in traffic_cars:
+                if car.lane == next_lane:
+                    distance_diff = abs(car.distance - next_distance)
+                    if distance_diff < 500:
+                        lane_clear = False
+                        break
+            
+            if lane_clear:
+                traffic_penalty -= 20  # Reward for choosing clear lane
+        
+        # Opponent interaction
+        opponent_cost = 0
+        if opponent:
+            opponent_lane = self.get_lane_from_x(opponent.x)
+            distance_to_opponent = next_distance - opponent.distance
+            
+            if is_police:
+                # Police: reward getting closer to thief, but never overtake before catching
+                if distance_to_opponent > 0:  # Police ahead of thief
+                    # STRONG penalty for being ahead - police should chase, not lead!
+                    opponent_cost += 500 + distance_to_opponent * 2
+                else:  # Police behind thief (good)
+                    # Small reward for closing distance
+                    opponent_cost -= abs(distance_to_opponent) * 0.1
+            else:
+                # Thief: reward staying ahead and away from police
+                if distance_to_opponent > 0:  # Thief ahead (good)
+                    opponent_cost -= 20
+                else:  # Thief behind police (bad)
+                    opponent_cost += abs(distance_to_opponent) * 0.2
+        
+        total_cost = distance_cost + lane_change_cost + traffic_penalty + opponent_cost
+        return max(1, total_cost)  # Ensure positive cost
+    
+    def find_path(self, start_lane, start_distance, goal_lane, goal_distance, 
+                  traffic_cars, opponent=None, ghost_mode=False, is_police=False):
+        """
+        A* pathfinding algorithm to find optimal path.
+        
+        Args:
+            start_lane: Starting lane index
+            start_distance: Starting distance
+            goal_lane: Goal lane index
+            goal_distance: Goal distance
+            traffic_cars: List of traffic cars to avoid
+            opponent: Opponent vehicle
+            ghost_mode: If True, can pass through traffic
+            is_police: If True, vehicle is police (different behavior)
+        
+        Returns:
+            List of (lane, distance) waypoints representing the path
+        """
+        # Initialize start node
+        start_h = self.calculate_heuristic(start_lane, start_distance, goal_lane, goal_distance)
+        start_node = AStarNode(start_lane, start_distance, 0, start_h)
+        
+        # Priority queue (open set) and closed set
+        open_set = []
+        heapq.heappush(open_set, start_node)
+        closed_set = set()
+        
+        # Track best g_cost for each position
+        best_g_cost = {(start_lane, start_distance): 0}
+        
+        # Performance limit: max iterations
+        max_iterations = 200
+        iterations = 0
+        
+        while open_set and iterations < max_iterations:
+            iterations += 1
+            
+            # Get node with lowest f_cost
+            current_node = heapq.heappop(open_set)
+            
+            # Check if reached goal
+            if abs(current_node.distance - goal_distance) < 100 and current_node.lane == goal_lane:
+                # Reconstruct path
+                path = []
+                node = current_node
+                while node:
+                    path.append((node.lane, node.distance))
+                    node = node.parent
+                return list(reversed(path))
+            
+            # Add to closed set
+            state = (current_node.lane, int(current_node.distance / 50))  # Discretize for closed set
+            if state in closed_set:
+                continue
+            closed_set.add(state)
+            
+            # Generate neighbors (possible next positions)
+            neighbors = self._generate_neighbors(current_node, goal_distance)
+            
+            for next_lane, next_distance in neighbors:
+                # Skip if not safe
+                if not self.is_position_safe(next_lane, next_distance, traffic_cars, opponent, ghost_mode):
+                    continue
+                
+                # Calculate costs
+                move_cost = self.calculate_path_cost(
+                    current_node, next_lane, next_distance, traffic_cars, 
+                    opponent, ghost_mode, is_police
+                )
+                new_g_cost = current_node.g_cost + move_cost
+                
+                # Check if this path is better
+                state_key = (next_lane, int(next_distance / 50))
+                if state_key in best_g_cost and new_g_cost >= best_g_cost[state_key]:
+                    continue
+                
+                best_g_cost[state_key] = new_g_cost
+                
+                # Calculate heuristic
+                h_cost = self.calculate_heuristic(next_lane, next_distance, goal_lane, goal_distance)
+                
+                # Create new node
+                new_node = AStarNode(next_lane, next_distance, new_g_cost, h_cost, current_node)
+                heapq.heappush(open_set, new_node)
+        
+        # No path found - return simple fallback path
+        return [(start_lane, start_distance), (goal_lane, goal_distance)]
+    
+    def _generate_neighbors(self, current_node, goal_distance):
+        """
+        Generate valid neighbor positions for A* expansion.
+        
+        Neighbors include:
+        - Moving forward in same lane
+        - Changing to adjacent lanes
+        - Adaptive step size based on distance to goal
+        """
+        neighbors = []
+        current_lane = current_node.lane
+        current_distance = current_node.distance
+        
+        # Adaptive step size: larger steps when far from goal, smaller when close
+        distance_to_goal = abs(goal_distance - current_distance)
+        if distance_to_goal > 1000:
+            step_size = 100  # Large steps when far
+        elif distance_to_goal > 300:
+            step_size = 50   # Medium steps
+        else:
+            step_size = 20   # Small steps when close
+        
+        # Move forward in current lane
+        next_distance = current_distance + step_size
+        if next_distance <= goal_distance + 100:  # Don't overshoot too much
+            neighbors.append((current_lane, next_distance))
+        
+        # Lane changes (to adjacent lanes only)
+        for lane_offset in [-1, 1]:
+            next_lane = current_lane + lane_offset
+            if 0 <= next_lane <= 2:  # Valid lane
+                # Lane change with forward movement
+                neighbors.append((next_lane, next_distance))
+        
+        return neighbors
+
 # Particle system
 particles = []
 
@@ -401,59 +742,87 @@ class PowerUp:
             float_offset = math.sin(pygame.time.get_ticks() / 300 + self.distance) * 8
             final_y = screen_y + float_offset
             
+            # LARGER SIZE for better visibility
+            size = 55 if self.for_police else 50
+            
             # Pulsing glow effect (more intense for police powerups)
             pulse_speed = 300 if self.for_police else 400
-            pulse = abs(math.sin(pygame.time.get_ticks() / pulse_speed)) * 20 + 15
+            pulse = abs(math.sin(pygame.time.get_ticks() / pulse_speed)) * 25 + 20
             
-            # Draw multiple glow layers
-            for r in range(int(pulse), 0, -3):
-                alpha = int(100 * (r / pulse))
-                glow_surf = pygame.Surface((self.width + r*2, self.height + r*2), pygame.SRCALPHA)
-                pygame.draw.circle(glow_surf, (*props['color'], alpha), 
-                                 (self.width//2 + r, self.height//2 + r), self.width//2 + r)
-                screen.blit(glow_surf, (int(lane_x - self.width//2 - r), int(final_y - self.height//2 - r)))
+            # Draw multiple glow layers with stronger colors
+            for r in range(int(pulse), 0, -4):
+                alpha = int(120 * (r / pulse))
+                glow_surf = pygame.Surface((size + r*2, size + r*2), pygame.SRCALPHA)
+                glow_color = (255, 50, 50) if self.for_police else (50, 150, 255)
+                pygame.draw.circle(glow_surf, (*glow_color, alpha), 
+                                 (size//2 + r, size//2 + r), size//2 + r)
+                screen.blit(glow_surf, (int(lane_x - size//2 - r), int(final_y - size//2 - r)))
             
-            # Main power-up circle (hexagon for police powerups)
+            # DISTINCT SHAPES: Hexagon for POLICE, Circle for THIEF
             if self.for_police:
-                # Draw hexagon for police powers
+                # Draw LARGER hexagon for police powers with RED border
                 points = []
                 sides = 6
                 for i in range(sides):
                     angle = (self.rotation + i * (360 / sides)) * math.pi / 180
-                    x = lane_x + math.cos(angle) * (self.width//2)
-                    y = final_y + math.sin(angle) * (self.height//2)
+                    x = lane_x + math.cos(angle) * (size//2)
+                    y = final_y + math.sin(angle) * (size//2)
                     points.append((int(x), int(y)))
-                pygame.draw.polygon(screen, props['color'], points)
-                pygame.draw.polygon(screen, WHITE, points, 3)
+                
+                # Dark red fill
+                pygame.draw.polygon(screen, (180, 0, 0), points)
+                # Bright red border (THICK)
+                pygame.draw.polygon(screen, (255, 0, 0), points, 5)
+                # Inner bright fill
+                inner_points = []
+                for i in range(sides):
+                    angle = (self.rotation + i * (360 / sides)) * math.pi / 180
+                    x = lane_x + math.cos(angle) * (size//2 - 8)
+                    y = final_y + math.sin(angle) * (size//2 - 8)
+                    inner_points.append((int(x), int(y)))
+                pygame.draw.polygon(screen, props['color'], inner_points)
+                
+                # Add "POLICE" label below
+                font_label = pygame.font.Font(None, 22)
+                label_text = font_label.render("POLICE", True, (255, 255, 255))
+                label_bg = pygame.Surface((label_text.get_width() + 8, label_text.get_height() + 4), pygame.SRCALPHA)
+                pygame.draw.rect(label_bg, (200, 0, 0, 220), label_bg.get_rect(), border_radius=3)
+                screen.blit(label_bg, (int(lane_x - label_text.get_width()//2 - 4), int(final_y + size//2 + 8)))
+                screen.blit(label_text, (int(lane_x - label_text.get_width()//2), int(final_y + size//2 + 10)))
             else:
-                # Draw circle for thief powers
-                pygame.draw.circle(screen, props['color'], (int(lane_x), int(final_y)), self.width//2)
+                # Draw CIRCLE for thief powers with BLUE border
+                # Dark blue fill
+                pygame.draw.circle(screen, (0, 80, 180), (int(lane_x), int(final_y)), size//2)
+                # Bright blue border (THICK)
+                pygame.draw.circle(screen, (50, 150, 255), (int(lane_x), int(final_y)), size//2, 5)
+                # Inner bright fill
+                pygame.draw.circle(screen, props['color'], (int(lane_x), int(final_y)), size//2 - 8)
+                
+                # Add "THIEF" label below
+                font_label = pygame.font.Font(None, 22)
+                label_text = font_label.render("THIEF", True, (255, 255, 255))
+                label_bg = pygame.Surface((label_text.get_width() + 8, label_text.get_height() + 4), pygame.SRCALPHA)
+                pygame.draw.rect(label_bg, (0, 100, 200, 220), label_bg.get_rect(), border_radius=3)
+                screen.blit(label_bg, (int(lane_x - label_text.get_width()//2 - 4), int(final_y + size//2 + 8)))
+                screen.blit(label_text, (int(lane_x - label_text.get_width()//2), int(final_y + size//2 + 10)))
             
-            # Inner circle with gradient effect
-            inner_color = tuple(min(255, c + 80) for c in props['color'])
-            pygame.draw.circle(screen, inner_color, (int(lane_x), int(final_y)), self.width//2 - 5)
-            
-            # Draw icon
-            font_icon = pygame.font.Font(None, 36)
+            # Draw icon (LARGER)
+            font_icon = pygame.font.Font(None, 42)
             icon_text = font_icon.render(props['icon'], True, WHITE)
             icon_rect = icon_text.get_rect(center=(int(lane_x), int(final_y)))
             screen.blit(icon_text, icon_rect)
             
-            # Rotating border (square for police, circle for thief)
-            border_points = []
-            segments = 4 if self.for_police else 8
-            rotation_speed = 2 if self.for_police else 1
-            for i in range(segments):
-                angle = (self.rotation * rotation_speed + i * (360 / segments)) * math.pi / 180
-                x = lane_x + math.cos(angle) * (self.width//2 + 8)
-                y = final_y + math.sin(angle) * (self.height//2 + 8)
-                border_points.append((int(x), int(y)))
-            
-            for i in range(len(border_points)):
-                start = border_points[i]
-                end = border_points[(i + 1) % len(border_points)]
-                border_color = RED if self.for_police else WHITE
-                pygame.draw.line(screen, border_color, start, end, 3)
+            # Rotating sparkles for extra visibility
+            sparkle_count = 4
+            rotation_speed = 3 if self.for_police else 2
+            for i in range(sparkle_count):
+                angle = (self.rotation * rotation_speed + i * (360 / sparkle_count)) * math.pi / 180
+                sparkle_dist = size//2 + 15
+                x = lane_x + math.cos(angle) * sparkle_dist
+                y = final_y + math.sin(angle) * sparkle_dist
+                sparkle_color = (255, 100, 100) if self.for_police else (100, 200, 255)
+                pygame.draw.circle(screen, sparkle_color, (int(x), int(y)), 4)
+                pygame.draw.circle(screen, WHITE, (int(x), int(y)), 2)
     
     def check_collision(self, player_x, player_y, player_width, player_height, camera_offset):
         """Check if player collected this power-up"""
@@ -549,6 +918,288 @@ class Vehicle:
                     self.speed = min(self.speed + 0.05, self.max_speed)
             elif speed_action == 'brake':
                 self.speed = max(self.speed - 0.3, self.max_speed * 0.5)
+    
+    def ai_decision_astar(self, traffic_cars, powerups, opponent, ghost_mode, astar_pathfinder):
+        """
+        Advanced AI decision making using A* pathfinding algorithm.
+        Finds optimal path considering obstacles, opponent, and objectives.
+        
+        Args:
+            traffic_cars: List of traffic cars to avoid
+            powerups: List of power-ups to collect
+            opponent: Opponent vehicle
+            ghost_mode: If True, can pass through traffic
+            astar_pathfinder: AStarPathfinder instance with appropriate heuristic
+        """
+        if self.crashed:
+            return
+        
+        # Determine current position
+        current_lane = astar_pathfinder.get_lane_from_x(self.x)
+        current_distance = self.distance
+        
+        # Determine goal based on vehicle type and situation
+        goal_lane = current_lane
+        goal_distance = current_distance + 500  # Default: look ahead 500 units
+        
+        if self.is_police:
+            # Police goal: INDEPENDENT pursuit strategy
+            if opponent:
+                distance_to_thief = opponent.distance - self.distance
+                
+                # Police makes INDEPENDENT decisions based on distance to thief
+                if distance_to_thief > 400:
+                    # FAR BEHIND: Move forward aggressively, find clearest path
+                    clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                        current_distance, traffic_cars, look_ahead=800
+                    )
+                    goal_lane = clearest_lane_info[0]  # Use clearest lane
+                    goal_distance = current_distance + 900  # Move forward fast
+                    
+                elif distance_to_thief > 200:
+                    # MEDIUM DISTANCE: Balance between pursuit and traffic avoidance
+                    # Look for police power-ups if available
+                    closest_police_powerup = None
+                    min_powerup_dist = float('inf')
+                    
+                    for powerup in powerups:
+                        if not powerup.collected and powerup.for_police:
+                            dist_to_powerup = powerup.distance - current_distance
+                            if 0 < dist_to_powerup < 600:
+                                if dist_to_powerup < min_powerup_dist:
+                                    min_powerup_dist = dist_to_powerup
+                                    closest_police_powerup = powerup
+                    
+                    if closest_police_powerup:
+                        # Go for police power-up
+                        goal_distance = closest_police_powerup.distance
+                        goal_lane = closest_police_powerup.lane
+                    else:
+                        # Move toward thief's general direction but use clear lanes
+                        thief_lane = astar_pathfinder.get_lane_from_x(opponent.x)
+                        
+                        # Check if thief's lane is clear
+                        lane_traffic_count = 0
+                        for car in traffic_cars:
+                            if car.lane == thief_lane:
+                                dist_to_car = car.distance - current_distance
+                                if 0 < dist_to_car < 500:
+                                    lane_traffic_count += 1
+                        
+                        if lane_traffic_count > 2:
+                            # Thief's lane is crowded, find better route
+                            clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                                current_distance, traffic_cars, look_ahead=700
+                            )
+                            goal_lane = clearest_lane_info[0]
+                        else:
+                            # Thief's lane is relatively clear, approach that direction
+                            goal_lane = thief_lane
+                        
+                        goal_distance = current_distance + 700
+                
+                elif distance_to_thief > 50:
+                    # CLOSE RANGE: Careful approach, avoid overtaking
+                    goal_distance = opponent.distance - 50  # Stay behind
+                    # Don't just copy thief's lane - evaluate best interception
+                    thief_lane = astar_pathfinder.get_lane_from_x(opponent.x)
+                    
+                    # Check adjacent lanes for better positioning
+                    best_intercept_lane = thief_lane
+                    min_obstacles = float('inf')
+                    
+                    for check_lane in [max(0, thief_lane - 1), thief_lane, min(2, thief_lane + 1)]:
+                        obstacle_count = 0
+                        for car in traffic_cars:
+                            if car.lane == check_lane:
+                                dist_to_car = abs(car.distance - goal_distance)
+                                if dist_to_car < 300:
+                                    obstacle_count += 1
+                        if obstacle_count < min_obstacles:
+                            min_obstacles = obstacle_count
+                            best_intercept_lane = check_lane
+                    
+                    goal_lane = best_intercept_lane
+                
+                else:
+                    # VERY CLOSE or EQUAL: CATCH POSITION - stay at or slightly behind thief
+                    goal_distance = max(opponent.distance - 20, current_distance)  # Never plan ahead!
+                    goal_lane = astar_pathfinder.get_lane_from_x(opponent.x)
+            else:
+                # No opponent visible, move forward using clearest lane
+                clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                    current_distance, traffic_cars, look_ahead=800
+                )
+                goal_lane = clearest_lane_info[0]
+                goal_distance = current_distance + 800
+        else:
+            # Thief goal: INDEPENDENT escape strategy
+            # Priority 1: Look for valuable power-ups
+            closest_powerup = None
+            min_powerup_dist = float('inf')
+            
+            for powerup in powerups:
+                if not powerup.collected and not powerup.for_police:
+                    # Check if powerup is ahead and reachable
+                    dist_to_powerup = powerup.distance - current_distance
+                    if 0 < dist_to_powerup < 1200:  # Increased search range
+                        # Prioritize based on power-up type and distance
+                        priority_bonus = 0
+                        if powerup.power_type in ['boost', 'ghost']:
+                            priority_bonus = -200  # High priority for escape powers
+                        elif powerup.power_type == 'freeze':
+                            priority_bonus = -100  # Medium priority
+                        
+                        effective_distance = dist_to_powerup + priority_bonus
+                        
+                        if effective_distance < min_powerup_dist:
+                            min_powerup_dist = effective_distance
+                            closest_powerup = powerup
+            
+            if closest_powerup:
+                # Target the power-up, but check if path is safe
+                goal_distance = closest_powerup.distance
+                goal_lane = closest_powerup.lane
+                
+                # Verify lane is not too crowded
+                traffic_in_lane = 0
+                for car in traffic_cars:
+                    if car.lane == goal_lane:
+                        dist_to_car = car.distance - current_distance
+                        if 0 < dist_to_car < 500:
+                            traffic_in_lane += 1
+                
+                # If target lane is too crowded, find alternate clear lane
+                if traffic_in_lane > 3:
+                    clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                        current_distance, traffic_cars, look_ahead=800
+                    )
+                    goal_lane = clearest_lane_info[0]
+                    goal_distance = current_distance + 800
+            else:
+                # Priority 2: No power-ups nearby - focus on maintaining lead
+                # Always use clearest lane for fastest progress
+                clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                    current_distance, traffic_cars, look_ahead=1000
+                )
+                goal_lane = clearest_lane_info[0]  # Use clearest lane
+                
+                # Adjust distance based on police proximity
+                if opponent:
+                    distance_to_police = opponent.distance - current_distance
+                    
+                    if distance_to_police > -100:  # Police very close (danger!)
+                        # URGENT: Maximum speed escape
+                        goal_distance = current_distance + 1000
+                    elif distance_to_police > -300:  # Police approaching
+                        # Move ahead aggressively
+                        goal_distance = current_distance + 850
+                    else:
+                        # Safe distance, maintain steady progress
+                        goal_distance = current_distance + 700
+                else:
+                    # No police visible, steady progress
+                    goal_distance = current_distance + 750
+        
+        # Find path using A*
+        path = astar_pathfinder.find_path(
+            start_lane=current_lane,
+            start_distance=current_distance,
+            goal_lane=goal_lane,
+            goal_distance=goal_distance,
+            traffic_cars=traffic_cars,
+            opponent=opponent,
+            ghost_mode=ghost_mode,
+            is_police=self.is_police
+        )
+        
+        # Execute path: follow the first few waypoints
+        if len(path) > 1:
+            # Get next waypoint
+            next_waypoint = path[1] if len(path) > 1 else path[0]
+            target_lane = next_waypoint[0]
+            target_distance = next_waypoint[1]
+            
+            # Convert lane to x position
+            target_x = astar_pathfinder.lane_positions[target_lane]
+            
+            # Smooth steering towards target lane
+            if abs(target_x - self.x) > 5:
+                steering_speed = 4 if self.speed > 6 else 5
+                
+                if target_x < self.x:
+                    self.x = max(ROAD_X + 35, self.x - steering_speed)
+                else:
+                    self.x = min(ROAD_X + ROAD_WIDTH - 35, self.x + steering_speed)
+            
+            # Speed control based on path and situation
+            if not self.crashed:
+                # IMPROVED: Check obstacles ahead with better detection
+                obstacle_ahead = False
+                closest_obstacle_distance = float('inf')
+                
+                for car in traffic_cars:
+                    if car.lane == current_lane:
+                        distance_to_car = car.distance - self.distance
+                        # Look further ahead (increased from 200 to 400)
+                        if 0 < distance_to_car < 400 and not ghost_mode:
+                            obstacle_ahead = True
+                            closest_obstacle_distance = min(closest_obstacle_distance, distance_to_car)
+                
+                # CRITICAL: Police speed control to prevent overtaking
+                if self.is_police and opponent:
+                    distance_to_thief = opponent.distance - self.distance
+                    
+                    # ZONE 1: Very close - extremely careful (CATCH zone)
+                    if distance_to_thief < 50:
+                        # At catch distance - move slowly to avoid overtaking
+                        target_speed = min(opponent.speed * 0.7, self.max_speed * 0.5)
+                        self.speed = max(self.speed - 0.4, target_speed)
+                        return  # Stop here, don't process further
+                    
+                    # ZONE 2: Close - match speed carefully
+                    elif distance_to_thief < 100:
+                        # Getting close - match thief's speed exactly
+                        target_speed = min(opponent.speed, self.max_speed * 0.85)
+                        if self.speed > target_speed:
+                            self.speed = max(self.speed - 0.25, target_speed)
+                        else:
+                            self.speed = min(self.speed + 0.1, target_speed)
+                        return  # Don't accelerate further
+                    
+                    # ZONE 3: Medium close - start slowing approach
+                    elif distance_to_thief < 150:
+                        # Approaching - slow down gradually
+                        target_speed = min(opponent.speed * 1.1, self.max_speed * 0.9)
+                        if self.speed > target_speed:
+                            self.speed = max(self.speed - 0.2, target_speed)
+                        else:
+                            self.speed = min(self.speed + 0.15, target_speed)
+                        return
+                    
+                    # ZONE 4: If somehow ahead (shouldn't happen) - STOP IMMEDIATELY
+                    elif distance_to_thief <= 0:
+                        # Police is ahead or equal - STOP to catch
+                        self.speed = max(self.speed - 0.6, 2)  # Minimum speed to maintain
+                        return
+                
+                # IMPROVED: Adaptive speed control based on obstacle distance
+                if obstacle_ahead:
+                    if closest_obstacle_distance < 150:
+                        # CRITICAL: Very close obstacle - brake hard!
+                        self.speed = max(self.speed - 0.5, self.max_speed * 0.4)
+                    elif closest_obstacle_distance < 250:
+                        # Close obstacle - slow down significantly
+                        self.speed = max(self.speed - 0.3, self.max_speed * 0.6)
+                    elif closest_obstacle_distance < 350:
+                        # Approaching obstacle - reduce speed
+                        self.speed = max(self.speed - 0.15, self.max_speed * 0.75)
+                    else:
+                        # Obstacle detected but far - maintain current speed
+                        pass
+                else:
+                    # No obstacles - accelerate toward max speed
+                    self.speed = min(self.speed + 0.2, self.max_speed)
     
     def ai_decision(self, traffic_cars, powerups, police_distance, camera_offset, ghost_mode):
         """
@@ -2130,6 +2781,13 @@ def main():
     # Initialize CSP solver for AI decision making
     csp_solver = CSPDecisionMaker()
     
+    # Initialize A* pathfinders with different heuristics
+    # Thief uses Manhattan distance (L1 norm) - better for structured lane-based movement
+    thief_astar = AStarPathfinder(heuristic_type='manhattan')
+    
+    # Police uses Euclidean distance (L2 norm) - better for direct pursuit
+    police_astar = AStarPathfinder(heuristic_type='euclidean')
+    
     while True:
         if not show_start_screen(screen):
             break
@@ -2149,22 +2807,24 @@ def main():
             distance = random.randint(500, FINISH_LINE_DISTANCE - 500)
             traffic_cars.append(TrafficCar(lane, distance))
         
-        # Spawn power-ups along the track
+        # Spawn power-ups along the track - REDUCED for balanced gameplay
         powerups = []
         
-        # Thief power-ups (blue/green theme)
+        # Thief power-ups (blue/green theme) - REDUCED from 35 to 10
         thief_power_types = ['freeze', 'boost', 'shield', 'ghost']
-        for i in range(35):  # 35 thief power-ups
+        for i in range(10):  # Balanced: 10 thief power-ups across 50km
             lane = random.randint(0, 2)
-            distance = random.randint(1000, FINISH_LINE_DISTANCE - 1000)
+            # Spread them evenly across the track
+            distance = random.randint(2000 + i * 4000, 2000 + (i + 1) * 4000)
             power_type = random.choice(thief_power_types)
             powerups.append(PowerUp(lane, distance, power_type, for_police=False))
         
-        # Police power-ups (red theme - police only)
+        # Police power-ups (red theme - police only) - REDUCED from 25 to 10
         police_power_types = ['spike', 'emp', 'turbo', 'roadblock', 'magnet']
-        for i in range(25):  # 25 police power-ups
+        for i in range(10):  # Balanced: 10 police power-ups across 50km
             lane = random.randint(0, 2)
-            distance = random.randint(1000, FINISH_LINE_DISTANCE - 1000)
+            # Spread them evenly across the track (offset from thief powerups)
+            distance = random.randint(3000 + i * 4000, 3000 + (i + 1) * 4000)
             power_type = random.choice(police_power_types)
             powerups.append(PowerUp(lane, distance, power_type, for_police=True))
         
@@ -2251,13 +2911,13 @@ def main():
             
             player.max_speed = 8 * speed_multiplier
             
-            # Advanced CSP-based AI decision making for thief
-            player.ai_decision_csp(
+            # Advanced A* pathfinding AI for thief (Manhattan distance heuristic)
+            player.ai_decision_astar(
                 traffic_cars=traffic_cars,
                 powerups=powerups,
                 opponent=police,
                 ghost_mode=(ghost_timer > 0),
-                csp_solver=csp_solver
+                astar_pathfinder=thief_astar
             )
             
             # Add exhaust particles for thief
@@ -2370,7 +3030,7 @@ def main():
             for powerup in powerups:
                 powerup.update(camera_offset)
             
-            # Police AI using CSP algorithm - affected by freeze power-up
+            # Police AI using A* pathfinding - affected by freeze power-up
             if freeze_timer > 0:
                 # Police is frozen
                 police.speed = 0
@@ -2379,13 +3039,13 @@ def main():
                 turbo_multiplier = 1.5 if turbo_timer > 0 else 1.0
                 police.max_speed = 8 * turbo_multiplier
                 
-                # Advanced CSP-based AI decision making for police
-                police.ai_decision_csp(
+                # Advanced A* pathfinding AI for police (Euclidean distance heuristic)
+                police.ai_decision_astar(
                     traffic_cars=traffic_cars,
                     powerups=powerups,  # Police now cares about their powerups
                     opponent=player,
                     ghost_mode=False,  # Police doesn't have ghost mode
-                    csp_solver=csp_solver
+                    astar_pathfinder=police_astar
                 )
             
             # Apply magnet effect - pull thief toward police
@@ -2503,9 +3163,20 @@ def main():
             # Camera follows player
             camera_offset = player.distance
             
-            # Check collision with police
-            dist_to_police = math.sqrt((player.x - police.x)**2 + (player.distance - police.distance)**2)
-            if dist_to_police < 60:
+            # IMPROVED: Check collision with police - catch when at same position
+            distance_diff = abs(player.distance - police.distance)
+            lateral_diff = abs(player.x - police.x)
+            
+            # Catch conditions: Police reached thief's position
+            if distance_diff < 80 and lateral_diff < 100:
+                # Police caught the thief!
+                game_over = True
+                winner = "police"
+            
+            # CRITICAL: Prevent police from overtaking without catching
+            # If police is ahead or equal to thief, game should end
+            if police.distance >= player.distance - 20:
+                # Police has reached/overtaken thief - this counts as caught
                 game_over = True
                 winner = "police"
             
