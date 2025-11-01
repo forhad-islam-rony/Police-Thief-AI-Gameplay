@@ -1,9 +1,15 @@
 import pygame
 import random
 import math
+import os
+import numpy as np
 
 # Initialize Pygame
 pygame.init()
+
+# Initialize audio with more channels for layered sounds
+pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
+pygame.mixer.set_num_channels(16)  # Support multiple simultaneous sounds
 
 # Screen dimensions
 SCREEN_WIDTH = 1000
@@ -35,8 +41,409 @@ PURPLE = (138, 43, 226)
 FPS = 60
 ROAD_WIDTH = 500
 ROAD_X = (SCREEN_WIDTH - ROAD_WIDTH) // 2
-FINISH_LINE_DISTANCE = 50000  # 50 KM track for extended gameplay
+FINISH_LINE_DISTANCE = 50000  # 50 KM track for balanced gameplay
 LANE_WIDTH = ROAD_WIDTH // 3
+
+# ============= PROFESSIONAL LAYERED AUDIO SYSTEM =============
+class AudioManager:
+    """
+    Professional game audio system with layered sounds and dynamic mixing.
+    Implements realistic racing game audio with:
+    - Engine sounds (idle + rev loops)
+    - Wind/road noise
+    - Dynamic police siren (distance-based)
+    - Collision/impact sounds
+    - Power-up feedback
+    - Menu and game music
+    - Win/Lose themes
+    """
+    
+    def __init__(self):
+        self.sounds_dir = "sounds"
+        self.sounds = {}
+        self.channels = {}
+        
+        # Master volumes
+        self.master_volume = 0.7
+        self.music_volume = 0.4
+        self.sfx_volume = 0.6
+        
+        # Audio channels (dedicated for each layer)
+        self.channels['engine_idle'] = pygame.mixer.Channel(1)
+        self.channels['engine_rev'] = pygame.mixer.Channel(2)
+        self.channels['wind'] = pygame.mixer.Channel(3)
+        self.channels['police_siren'] = pygame.mixer.Channel(4)
+        self.channels['traffic_ambient'] = pygame.mixer.Channel(5)
+        self.channels['crash'] = pygame.mixer.Channel(6)
+        self.channels['powerup'] = pygame.mixer.Channel(7)
+        self.channels['skid'] = pygame.mixer.Channel(8)
+        
+        # State tracking
+        self.engine_running = False
+        self.siren_playing = False
+        self.current_speed_ratio = 0.0
+        self.police_distance = 1000
+        
+        # Generate procedural sounds (fallback if no audio files)
+        self._generate_procedural_sounds()
+        
+        # Try to load external sound files
+        self._load_sound_files()
+    
+    def _generate_procedural_sounds(self):
+        """Generate basic procedural sounds as fallback"""
+        import numpy as np
+        sample_rate = 44100
+        
+        # 1. ENGINE IDLE - Low rumble (40Hz base)
+        duration = 2.0
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        engine_idle = np.zeros_like(t)
+        engine_idle += 0.3 * np.sin(2 * np.pi * 40 * t)
+        engine_idle += 0.2 * np.sin(2 * np.pi * 80 * t)
+        engine_idle += 0.15 * np.sin(2 * np.pi * 120 * t)
+        engine_idle += 0.03 * np.random.uniform(-1, 1, len(t))
+        
+        # Smooth loop
+        fade = int(0.1 * sample_rate)
+        engine_idle[:fade] *= np.linspace(0, 1, fade)
+        engine_idle[-fade:] *= np.linspace(1, 0, fade)
+        
+        engine_idle = np.clip(engine_idle, -1, 1)
+        engine_idle = (engine_idle * 32767 * 0.4).astype(np.int16)
+        engine_idle_stereo = np.column_stack((engine_idle, engine_idle))
+        self.sounds['engine_idle'] = pygame.sndarray.make_sound(engine_idle_stereo)
+        
+        # 2. ENGINE REV - Higher pitched (80-200Hz sweep)
+        duration = 1.5
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        engine_rev = np.zeros_like(t)
+        
+        # Variable frequency for rev sound
+        freq_mod = 120 + 80 * np.sin(2 * np.pi * 2 * t)
+        engine_rev = 0.35 * np.sin(2 * np.pi * freq_mod * t)
+        engine_rev += 0.2 * np.sin(2 * np.pi * freq_mod * 2 * t)
+        engine_rev += 0.05 * np.random.uniform(-1, 1, len(t))
+        
+        fade = int(0.05 * sample_rate)
+        engine_rev[:fade] *= np.linspace(0, 1, fade)
+        engine_rev[-fade:] *= np.linspace(1, 0, fade)
+        
+        engine_rev = np.clip(engine_rev, -1, 1)
+        engine_rev = (engine_rev * 32767 * 0.3).astype(np.int16)
+        engine_rev_stereo = np.column_stack((engine_rev, engine_rev))
+        self.sounds['engine_rev'] = pygame.sndarray.make_sound(engine_rev_stereo)
+        
+        # 3. WIND/ROAD NOISE
+        duration = 3.0
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        wind = 0.15 * np.random.uniform(-1, 1, len(t))
+        
+        # Low-pass filter effect
+        for i in range(1, len(wind)):
+            wind[i] = 0.7 * wind[i] + 0.3 * wind[i-1]
+        
+        fade = int(0.2 * sample_rate)
+        wind[:fade] *= np.linspace(0, 1, fade)
+        wind[-fade:] *= np.linspace(1, 0, fade)
+        
+        wind = (wind * 32767).astype(np.int16)
+        wind_stereo = np.column_stack((wind, wind))
+        self.sounds['wind'] = pygame.sndarray.make_sound(wind_stereo)
+        
+        # 4. POLICE SIREN - Wail pattern
+        duration = 3.0
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        freq = 650 + 100 * np.sin(2 * np.pi * 1.5 * t)
+        siren = 0.4 * np.sin(2 * np.pi * freq * t)
+        siren += 0.15 * np.sin(2 * np.pi * freq * 2 * t)
+        
+        fade = int(0.15 * sample_rate)
+        siren[:fade] *= np.linspace(0, 1, fade)
+        siren[-fade:] *= np.linspace(1, 0, fade)
+        
+        siren = (siren * 32767 * 0.5).astype(np.int16)
+        siren_stereo = np.column_stack((siren, siren))
+        self.sounds['police_siren'] = pygame.sndarray.make_sound(siren_stereo)
+        
+        # 5. TRAFFIC AMBIENT
+        duration = 4.0
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        traffic = np.zeros_like(t)
+        traffic += 0.06 * np.sin(2 * np.pi * 55 * t * (1 + 0.2 * np.sin(2 * np.pi * 0.3 * t)))
+        traffic += 0.04 * np.sin(2 * np.pi * 70 * t * (1 + 0.2 * np.sin(2 * np.pi * 0.5 * t)))
+        traffic += 0.03 * np.random.uniform(-1, 1, len(t))
+        
+        fade = int(0.3 * sample_rate)
+        traffic[:fade] *= np.linspace(0, 1, fade)
+        traffic[-fade:] *= np.linspace(1, 0, fade)
+        
+        traffic = (traffic * 32767 * 0.3).astype(np.int16)
+        traffic_stereo = np.column_stack((traffic, traffic))
+        self.sounds['traffic_ambient'] = pygame.sndarray.make_sound(traffic_stereo)
+        
+        # 6. CRASH SOUND
+        duration = 0.8
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        crash = 0.7 * np.random.uniform(-1, 1, len(t)) * np.exp(-5 * t)
+        crash += 0.3 * np.sin(2 * np.pi * 80 * t) * np.exp(-6 * t)
+        crash = (crash * 32767 * 0.7).astype(np.int16)
+        crash_stereo = np.column_stack((crash, crash))
+        self.sounds['crash'] = pygame.sndarray.make_sound(crash_stereo)
+        
+        # 7. POWERUP PICKUP
+        duration = 0.3
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        freq_sweep = 400 + 600 * (t / duration)
+        powerup = 0.4 * np.sin(2 * np.pi * freq_sweep * t) * np.exp(-4 * t)
+        powerup = (powerup * 32767 * 0.5).astype(np.int16)
+        powerup_stereo = np.column_stack((powerup, powerup))
+        self.sounds['powerup'] = pygame.sndarray.make_sound(powerup_stereo)
+        
+        # 8. TIRE SKID
+        duration = 0.6
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        skid = 0.3 * np.random.uniform(-1, 1, len(t))
+        skid += 0.2 * np.sin(2 * np.pi * 1400 * t * (1 + 0.1 * np.sin(2 * np.pi * 30 * t)))
+        skid *= np.exp(-2 * t)
+        skid = (skid * 32767 * 0.4).astype(np.int16)
+        skid_stereo = np.column_stack((skid, skid))
+        self.sounds['skid'] = pygame.sndarray.make_sound(skid_stereo)
+        
+        # 9. BOOST/TURBO
+        duration = 0.7
+        t = np.linspace(0, duration, int(sample_rate * duration))
+        freq_sweep = 150 + 500 * (t / duration)**2
+        boost = 0.5 * np.sin(2 * np.pi * freq_sweep * t)
+        boost += 0.2 * np.random.uniform(-1, 1, len(t))
+        boost *= np.exp(-1.2 * t)
+        boost = (boost * 32767 * 0.5).astype(np.int16)
+        boost_stereo = np.column_stack((boost, boost))
+        self.sounds['boost'] = pygame.sndarray.make_sound(boost_stereo)
+        
+        print("✓ Procedural sounds generated")
+    
+    def _load_sound_files(self):
+        """Try to load external sound files if available"""
+        sound_files = {
+            'engine_idle': 'engine_idle.wav',
+            'engine_rev': 'engine_rev_loop.wav',
+            'wind': 'wind_loop.wav',
+            'police_siren': 'police_siren_loop.wav',
+            'traffic_ambient': 'traffic_ambient.wav',
+            'crash': 'crash.wav',
+            'powerup': 'pickup.wav',
+            'boost': 'boost.wav',
+            'skid': 'skid.wav',
+            'menu_music': 'menu_theme.mp3',
+            'game_music': 'driving_music.mp3',
+            'win_music': 'win_theme.mp3',
+            'lose_music': 'lose_theme.mp3'
+        }
+        
+        loaded_count = 0
+        for key, filename in sound_files.items():
+            filepath = os.path.join(self.sounds_dir, filename)
+            if os.path.exists(filepath):
+                try:
+                    if filename.endswith('.mp3') or filename.endswith('.ogg'):
+                        # Music files (don't load as Sound objects)
+                        continue
+                    else:
+                        self.sounds[key] = pygame.mixer.Sound(filepath)
+                        loaded_count += 1
+                        print(f"✓ Loaded: {filename}")
+                except Exception as e:
+                    print(f"✗ Failed to load {filename}: {e}")
+        
+        if loaded_count > 0:
+            print(f"✓ Loaded {loaded_count} external sound files")
+        else:
+            print("ℹ No external sound files found, using procedural sounds")
+    
+    def start_engine_layers(self):
+        """Start all engine sound layers"""
+        if not self.engine_running:
+            if 'engine_idle' in self.sounds:
+                self.channels['engine_idle'].play(self.sounds['engine_idle'], loops=-1)
+                self.channels['engine_idle'].set_volume(0.5 * self.sfx_volume * self.master_volume)
+            
+            if 'engine_rev' in self.sounds:
+                self.channels['engine_rev'].play(self.sounds['engine_rev'], loops=-1)
+                self.channels['engine_rev'].set_volume(0.0)  # Start silent
+            
+            if 'wind' in self.sounds:
+                self.channels['wind'].play(self.sounds['wind'], loops=-1)
+                self.channels['wind'].set_volume(0.0)  # Start silent
+            
+            self.engine_running = True
+            print("🏎️ Engine layers started")
+    
+    def stop_engine_layers(self):
+        """Stop all engine sound layers"""
+        if self.engine_running:
+            self.channels['engine_idle'].stop()
+            self.channels['engine_rev'].stop()
+            self.channels['wind'].stop()
+            self.engine_running = False
+    
+    def update_engine_sound(self, current_speed, max_speed):
+        """
+        Dynamically adjust engine layers based on speed.
+        
+        Low speed: High idle volume, low rev volume
+        High speed: Low idle volume, high rev volume
+        """
+        if not self.engine_running:
+            return
+        
+        speed_ratio = min(current_speed / max_speed, 1.0)
+        self.current_speed_ratio = speed_ratio
+        
+        # Engine idle fades out as speed increases
+        idle_volume = (1.0 - speed_ratio * 0.8) * 0.5 * self.sfx_volume * self.master_volume
+        self.channels['engine_idle'].set_volume(idle_volume)
+        
+        # Engine rev fades in as speed increases
+        rev_volume = speed_ratio * 0.6 * self.sfx_volume * self.master_volume
+        self.channels['engine_rev'].set_volume(rev_volume)
+        
+        # Wind noise increases with speed
+        wind_volume = speed_ratio * 0.4 * self.sfx_volume * self.master_volume
+        self.channels['wind'].set_volume(wind_volume)
+    
+    def start_traffic_ambient(self):
+        """Start ambient traffic sound"""
+        if 'traffic_ambient' in self.sounds:
+            self.channels['traffic_ambient'].play(self.sounds['traffic_ambient'], loops=-1)
+            self.channels['traffic_ambient'].set_volume(0.25 * self.sfx_volume * self.master_volume)
+    
+    def stop_traffic_ambient(self):
+        """Stop traffic ambient"""
+        self.channels['traffic_ambient'].stop()
+    
+    def update_police_siren(self, police_distance):
+        """
+        Dynamic police siren based on distance.
+        Only plays when police is close (<350 units)
+        Volume increases as police gets closer
+        """
+        self.police_distance = police_distance
+        
+        if police_distance < 350:
+            # Police is close - play siren
+            if not self.siren_playing:
+                if 'police_siren' in self.sounds:
+                    self.channels['police_siren'].play(self.sounds['police_siren'], loops=-1)
+                    self.siren_playing = True
+            
+            # Calculate volume based on distance
+            # Full volume at <150, fade out to 350
+            if police_distance < 150:
+                volume = 1.0
+            else:
+                volume = 1.0 - ((police_distance - 150) / 200)
+            
+            self.channels['police_siren'].set_volume(volume * 0.5 * self.sfx_volume * self.master_volume)
+        else:
+            # Police is far - fade out siren
+            if self.siren_playing:
+                self.channels['police_siren'].fadeout(800)
+                self.siren_playing = False
+    
+    def play_crash(self):
+        """Play crash sound"""
+        if 'crash' in self.sounds:
+            self.channels['crash'].play(self.sounds['crash'])
+            self.channels['crash'].set_volume(0.7 * self.sfx_volume * self.master_volume)
+    
+    def play_powerup(self):
+        """Play powerup pickup sound"""
+        if 'powerup' in self.sounds:
+            self.channels['powerup'].play(self.sounds['powerup'])
+            self.channels['powerup'].set_volume(0.5 * self.sfx_volume * self.master_volume)
+    
+    def play_boost(self):
+        """Play boost/turbo sound"""
+        if 'boost' in self.sounds:
+            # Use a free channel for boost (not dedicated)
+            boost_channel = pygame.mixer.find_channel()
+            if boost_channel:
+                boost_channel.play(self.sounds['boost'])
+                boost_channel.set_volume(0.6 * self.sfx_volume * self.master_volume)
+    
+    def play_skid(self):
+        """Play tire skid sound"""
+        if 'skid' in self.sounds and not self.channels['skid'].get_busy():
+            self.channels['skid'].play(self.sounds['skid'])
+            self.channels['skid'].set_volume(0.4 * self.sfx_volume * self.master_volume)
+    
+    def play_menu_music(self):
+        """Play menu theme music"""
+        music_file = os.path.join(self.sounds_dir, 'menu_theme.mp3')
+        if os.path.exists(music_file):
+            pygame.mixer.music.load(music_file)
+            pygame.mixer.music.set_volume(self.music_volume * self.master_volume)
+            pygame.mixer.music.play(-1)
+            print("🎵 Menu music playing")
+    
+    def play_game_music(self):
+        """Play in-game racing music"""
+        pygame.mixer.music.fadeout(1200)
+        pygame.time.wait(1300)
+        
+        music_file = os.path.join(self.sounds_dir, 'driving_music.mp3')
+        if os.path.exists(music_file):
+            pygame.mixer.music.load(music_file)
+            pygame.mixer.music.set_volume(self.music_volume * self.master_volume * 0.7)
+            pygame.mixer.music.play(-1)
+            print("🎵 Game music playing")
+    
+    def play_win_music(self):
+        """Play victory music"""
+        pygame.mixer.music.fadeout(1000)
+        pygame.time.wait(1100)
+        
+        music_file = os.path.join(self.sounds_dir, 'win_theme.mp3')
+        if os.path.exists(music_file):
+            pygame.mixer.music.load(music_file)
+            pygame.mixer.music.set_volume(self.music_volume * self.master_volume)
+            pygame.mixer.music.play()
+            print("🎵 Win music playing")
+    
+    def play_lose_music(self):
+        """Play defeat music"""
+        pygame.mixer.music.fadeout(1000)
+        pygame.time.wait(1100)
+        
+        music_file = os.path.join(self.sounds_dir, 'lose_theme.mp3')
+        if os.path.exists(music_file):
+            pygame.mixer.music.load(music_file)
+            pygame.mixer.music.set_volume(self.music_volume * self.master_volume)
+            pygame.mixer.music.play()
+            print("🎵 Lose music playing")
+    
+    def stop_all_sounds(self):
+        """Stop all sound effects and music"""
+        self.stop_engine_layers()
+        self.stop_traffic_ambient()
+        if self.siren_playing:
+            self.channels['police_siren'].stop()
+            self.siren_playing = False
+        pygame.mixer.music.stop()
+
+# Create global audio manager
+try:
+    import numpy as np
+    audio_manager = AudioManager()
+    print("🔊 Audio Manager initialized successfully")
+except Exception as e:
+    print(f"⚠️ Audio Manager initialization failed: {e}")
+    # Create dummy audio manager
+    class DummyAudioManager:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+    audio_manager = DummyAudioManager()
 
 # Fuzzy Logic System for Realistic AI Decision Making
 class FuzzyLogicController:
@@ -1697,17 +2104,35 @@ class PowerUp:
         # Power-up types and their properties
         # Thief power-ups
         self.types = {
-            'freeze': {'color': (100, 200, 255), 'icon': '❄️', 'name': 'Freeze Police'},
+            'freeze': {'color': (100, 200, 255), 'icon': '🌀', 'name': 'Stagger Slow'},
             'boost': {'color': (255, 200, 0), 'icon': '⚡', 'name': 'Speed Boost'},
             'shield': {'color': (150, 255, 150), 'icon': '🛡️', 'name': 'Shield'},
-            'ghost': {'color': (200, 150, 255), 'icon': '👻', 'name': 'Ghost Mode'},
+            'ghost': {'color': (200, 150, 255), 'icon': '👻', 'name': 'Ghost (1 Forgive)'},
             # Police-exclusive power-ups (red theme)
             'spike': {'color': (255, 50, 50), 'icon': '🔺', 'name': 'Spike Strip'},
-            'emp': {'color': (255, 100, 255), 'icon': '⚡', 'name': 'EMP Blast'},
+            'emp': {'color': (255, 100, 255), 'icon': '💫', 'name': 'Stagger Slow'},
             'turbo': {'color': (255, 150, 0), 'icon': '🔥', 'name': 'Turbo Boost'},
             'roadblock': {'color': (200, 50, 50), 'icon': '🚧', 'name': 'Roadblock'},
             'magnet': {'color': (150, 150, 255), 'icon': '🧲', 'name': 'Magnetic Pull'}
         }
+        
+        # Power-up priority values (higher = more valuable)
+        # Balanced to favor defensive & positioning powers over game-breaking ones
+        self.priority = {
+            'boost': 1.2,      # Moderate priority - speed advantage
+            'shield': 1.4,     # High priority - crash protection
+            'ghost': 1.5,      # Highest priority - mistake forgiveness
+            'freeze': 1.0,     # Base priority - temporary hindrance
+            'turbo': 1.2,      # Moderate priority - speed advantage
+            'spike': 1.1,      # Low-moderate priority - slow effect
+            'emp': 1.3,        # High priority - speed + steering hindrance
+            'magnet': 1.4,     # High priority - positioning control
+            'roadblock': 1.0   # Base priority - situational use
+        }
+    
+    def get_priority_value(self):
+        """Get the priority value for this power-up type"""
+        return self.priority.get(self.power_type, 1.0)
     
     def update(self, camera_offset):
         """Update power-up animation"""
@@ -1738,17 +2163,18 @@ class PowerUp:
             pulse = abs(math.sin(pygame.time.get_ticks() / pulse_speed)) * 25 + 20
             
             # Draw multiple glow layers with stronger colors
+            # SWAPPED: Police (blue car) gets blue glow, Thief (red car) gets red glow
             for r in range(int(pulse), 0, -4):
                 alpha = int(120 * (r / pulse))
                 glow_surf = pygame.Surface((size + r*2, size + r*2), pygame.SRCALPHA)
-                glow_color = (255, 50, 50) if self.for_police else (50, 150, 255)
+                glow_color = (50, 150, 255) if self.for_police else (255, 50, 50)  # SWAPPED
                 pygame.draw.circle(glow_surf, (*glow_color, alpha), 
                                  (size//2 + r, size//2 + r), size//2 + r)
                 screen.blit(glow_surf, (int(lane_x - size//2 - r), int(final_y - size//2 - r)))
             
-            # DISTINCT SHAPES: Hexagon for POLICE, Circle for THIEF
+            # DISTINCT SHAPES: Hexagon for POLICE (blue theme), Circle for THIEF (red theme)
             if self.for_police:
-                # Draw LARGER hexagon for police powers with RED border
+                # Draw LARGER hexagon for police powers with BLUE border (matches police car)
                 points = []
                 sides = 6
                 for i in range(sides):
@@ -1757,10 +2183,10 @@ class PowerUp:
                     y = final_y + math.sin(angle) * (size//2)
                     points.append((int(x), int(y)))
                 
-                # Dark red fill
-                pygame.draw.polygon(screen, (180, 0, 0), points)
-                # Bright red border (THICK)
-                pygame.draw.polygon(screen, (255, 0, 0), points, 5)
+                # Dark blue fill (was dark red)
+                pygame.draw.polygon(screen, (0, 80, 180), points)
+                # Bright blue border (THICK) (was bright red)
+                pygame.draw.polygon(screen, (50, 150, 255), points, 5)
                 # Inner bright fill
                 inner_points = []
                 for i in range(sides):
@@ -1774,15 +2200,15 @@ class PowerUp:
                 font_label = pygame.font.Font(None, 22)
                 label_text = font_label.render("POLICE", True, (255, 255, 255))
                 label_bg = pygame.Surface((label_text.get_width() + 8, label_text.get_height() + 4), pygame.SRCALPHA)
-                pygame.draw.rect(label_bg, (200, 0, 0, 220), label_bg.get_rect(), border_radius=3)
+                pygame.draw.rect(label_bg, (0, 100, 200, 220), label_bg.get_rect(), border_radius=3)  # Blue label
                 screen.blit(label_bg, (int(lane_x - label_text.get_width()//2 - 4), int(final_y + size//2 + 8)))
                 screen.blit(label_text, (int(lane_x - label_text.get_width()//2), int(final_y + size//2 + 10)))
             else:
-                # Draw CIRCLE for thief powers with BLUE border
-                # Dark blue fill
-                pygame.draw.circle(screen, (0, 80, 180), (int(lane_x), int(final_y)), size//2)
-                # Bright blue border (THICK)
-                pygame.draw.circle(screen, (50, 150, 255), (int(lane_x), int(final_y)), size//2, 5)
+                # Draw CIRCLE for thief powers with RED border (matches thief car)
+                # Dark red fill (was dark blue)
+                pygame.draw.circle(screen, (180, 0, 0), (int(lane_x), int(final_y)), size//2)
+                # Bright red border (THICK) (was bright blue)
+                pygame.draw.circle(screen, (255, 0, 0), (int(lane_x), int(final_y)), size//2, 5)
                 # Inner bright fill
                 pygame.draw.circle(screen, props['color'], (int(lane_x), int(final_y)), size//2 - 8)
                 
@@ -1790,7 +2216,7 @@ class PowerUp:
                 font_label = pygame.font.Font(None, 22)
                 label_text = font_label.render("THIEF", True, (255, 255, 255))
                 label_bg = pygame.Surface((label_text.get_width() + 8, label_text.get_height() + 4), pygame.SRCALPHA)
-                pygame.draw.rect(label_bg, (0, 100, 200, 220), label_bg.get_rect(), border_radius=3)
+                pygame.draw.rect(label_bg, (200, 0, 0, 220), label_bg.get_rect(), border_radius=3)  # Red label
                 screen.blit(label_bg, (int(lane_x - label_text.get_width()//2 - 4), int(final_y + size//2 + 8)))
                 screen.blit(label_text, (int(lane_x - label_text.get_width()//2), int(final_y + size//2 + 10)))
             
@@ -1801,6 +2227,7 @@ class PowerUp:
             screen.blit(icon_text, icon_rect)
             
             # Rotating sparkles for extra visibility
+            # SWAPPED: Police (blue car) gets blue sparkles, Thief (red car) gets red sparkles
             sparkle_count = 4
             rotation_speed = 3 if self.for_police else 2
             for i in range(sparkle_count):
@@ -1808,7 +2235,7 @@ class PowerUp:
                 sparkle_dist = size//2 + 15
                 x = lane_x + math.cos(angle) * sparkle_dist
                 y = final_y + math.sin(angle) * sparkle_dist
-                sparkle_color = (255, 100, 100) if self.for_police else (100, 200, 255)
+                sparkle_color = (100, 200, 255) if self.for_police else (255, 100, 100)  # SWAPPED
                 pygame.draw.circle(screen, sparkle_color, (int(x), int(y)), 4)
                 pygame.draw.circle(screen, WHITE, (int(x), int(y)), 2)
     
@@ -1861,6 +2288,10 @@ class Vehicle:
         self.distance = 0
         self.wheel_rotation = 0
         
+        # Track previous position for skid detection
+        self.prev_x = x
+        self.skid_cooldown = 0
+        
         # Power-up effects
         self.active_powerups = {}
         self.shield_active = False
@@ -1868,6 +2299,22 @@ class Vehicle:
         self.crashed = False
         self.crash_timer = 0
         self.crash_spin = 0
+    
+    def check_sharp_steering(self):
+        """Detect sharp steering and play skid sound"""
+        if self.skid_cooldown > 0:
+            self.skid_cooldown -= 1
+            return
+        
+        # Calculate steering change
+        steering_change = abs(self.x - self.prev_x)
+        
+        # If steering sharply at high speed, play skid sound
+        if steering_change > 8 and self.speed > 5.0:
+            audio_manager.play_skid()
+            self.skid_cooldown = 40  # Prevent rapid repeats
+        
+        self.prev_x = self.x
     
     def get_speed_kmh(self):
         """Convert speed units to km/h for display"""
@@ -1898,22 +2345,106 @@ class Vehicle:
                 self.crashed = False
                 self.crash_spin = 0
     
+    def is_lane_safe_for_powerup(self, target_lane, traffic_cars, lookahead=250):
+        """
+        Check if it's safe to switch to target lane for power-up collection.
+        
+        Args:
+            target_lane: The lane index (0, 1, or 2) to check
+            traffic_cars: List of traffic car objects
+            lookahead: Distance ahead to check for obstacles (default 250)
+            
+        Returns:
+            bool: True if lane is safe, False if traffic detected
+        """
+        for car in traffic_cars:
+            if car.lane == target_lane:
+                # Calculate relative distance to traffic car
+                relative_distance = car.distance - self.distance
+                
+                # Check if traffic is in our lookahead range
+                if 0 < relative_distance < lookahead:
+                    return False  # Traffic detected - unsafe
+        
+        return True  # No traffic detected - safe to switch
+    
+    def choose_best_power(self, powers, traffic_cars, lane_positions):
+        """
+        Intelligently choose the best power-up to collect based on:
+        - Power priority value
+        - Distance to power-up
+        - Lane safety
+        
+        Args:
+            powers: List of available power-ups
+            traffic_cars: List of traffic cars for safety check
+            lane_positions: Dictionary mapping lane index to X position
+            
+        Returns:
+            PowerUp object or None if no good option exists
+        """
+        best_power = None
+        best_score = 0
+        
+        for p in powers:
+            # Skip if already collected
+            if p.collected:
+                continue
+            
+            # Skip if wrong type (thief can't collect police powers and vice versa)
+            if self.is_police and not p.for_police:
+                continue
+            if not self.is_police and p.for_police:
+                continue
+            
+            # Calculate distance to power-up
+            dist = abs(p.distance - self.distance)
+            
+            # Ignore powers that are too far away
+            if dist > 400:
+                continue
+            
+            # Get power-up priority value (1.0 to 1.5)
+            value = p.get_priority_value()
+            
+            # Closeness factor (closer = better)
+            closeness = 1.0 / (dist + 1)
+            
+            # Lane safety check
+            lane_risk = 0 if self.is_lane_safe_for_powerup(p.lane, traffic_cars, lookahead=250) else 1.2
+            
+            # Calculate final score
+            score = (value * closeness) - lane_risk
+            
+            # Track best power-up
+            if score > best_score:
+                best_score = score
+                best_power = p
+        
+        return best_power
+    
     def priority_decision_hierarchy(self, traffic_cars, powerups, opponent, ghost_mode,
                                    fuzzy_controller, minimax_solver, astar_pathfinder):
         """
         ======================================================================
-        PRIORITY DECISION HIERARCHY - STEP 2 IMPLEMENTATION
+        PRIORITY DECISION HIERARCHY - ENHANCED WITH POWER COLLECTION
         ======================================================================
-        Intelligent blending of multiple AI algorithms based on situation priority.
+        Intelligent blending of multiple AI algorithms with clear priority order.
         
-        PRIORITY LEVELS:
-        1. SAFETY (Always Active) - Predictive collision avoidance
-        2. FUZZY (Tactical) - Close-range smooth reactions
-        3. MINIMAX (Strategic) - Medium-range adversarial planning
-        4. A* (Pathfinding) - Long-range optimal routing
+        PRIORITY LEVELS (CRITICAL ORDER):
+        1. SAFETY (Always Active) - Predictive collision avoidance - HIGHEST PRIORITY
+        2. POWER COLLECTION (When Safe) - Micro-steering toward valuable powers
+        3. FUZZY (Tactical) - Close-range smooth reactions
+        4. MINIMAX (Strategic) - Medium-range adversarial planning
+        5. A* (Pathfinding) - Long-range optimal routing
         
-        Instead of HARD SWITCHING between algorithms (which causes jerky behavior),
-        this system BLENDS their outputs with weights based on situation urgency.
+        PRIORITY ORDER FLOW:
+        - IF collision danger: → Avoid collision (safety override)
+        - ELIF safe power exists: → Micro-steer toward power (smooth collection)
+        - ELSE: → Continue chase/escape behavior (algorithm blending)
+        
+        Collision avoidance remains #1 priority forever.
+        Power collection only happens when safe.
         ======================================================================
         """
         if self.crashed:
@@ -1928,7 +2459,29 @@ class Vehicle:
             self._execute_safety_override(safety_check, fuzzy_controller)
             return
         
-        # ===== GATHER RECOMMENDATIONS FROM ALL SYSTEMS =====
+        # ===== PRIORITY 2: SAFE POWER COLLECTION (MICRO-STEERING) =====
+        # Only attempt power collection if NOT in high danger
+        urgency = safety_check['recommended_action']['urgency']
+        target_power = None
+        
+        if urgency not in ['high', 'critical']:
+            # Safe enough to consider power collection
+            lane_positions = fuzzy_controller.lane_positions
+            target_power = self.choose_best_power(powerups, traffic_cars, lane_positions)
+            
+            if target_power is not None:
+                # Apply MICRO-STEERING toward power-up (smooth movement)
+                target_x = lane_positions[target_power.lane]
+                steering_strength = 0.07  # Gentle steering (7% per frame)
+                
+                # Calculate steering amount
+                steering_delta = (target_x - self.x) * steering_strength
+                
+                # Apply smooth steering with road boundaries
+                self.x += steering_delta
+                self.x = max(ROAD_X + 35, min(ROAD_X + ROAD_WIDTH - 35, self.x))
+        
+        # ===== PRIORITY 3: GATHER RECOMMENDATIONS FROM ALL SYSTEMS =====
         current_lane = fuzzy_controller.get_lane_from_x(self.x)
         distance_to_opponent = abs(opponent.distance - self.distance) if opponent else float('inf')
         
@@ -1940,7 +2493,7 @@ class Vehicle:
             'astar': None
         }
         
-        # ===== DETERMINE WEIGHTS BASED ON SITUATION =====
+        # ===== PRIORITY 4: DETERMINE WEIGHTS BASED ON SITUATION =====
         # Weights determine how much each algorithm influences the final decision
         weights = {
             'safety': 0.0,
@@ -2354,9 +2907,9 @@ class Vehicle:
             if speed_action == 'accelerate':
                 self.speed = min(self.speed + 0.2, self.max_speed)
             elif speed_action == 'maintain':
-                # Maintain current speed with slight drift toward max
-                if self.speed < self.max_speed * 0.95:
-                    self.speed = min(self.speed + 0.05, self.max_speed)
+                # Maintain at FULL max speed - no reduction
+                if self.speed < self.max_speed - 0.1:
+                    self.speed = min(self.speed + 0.08, self.max_speed)
             elif speed_action == 'brake':
                 self.speed = max(self.speed - 0.3, self.max_speed * 0.5)
     
@@ -2515,19 +3068,47 @@ class Vehicle:
             
             # Execute speed action with INDEPENDENT acceleration rates
             if not self.crashed:
-                if best_action.speed_change == 'accelerate':
-                    # BOTH: Fast acceleration recovery
-                    accel_mult = 1.3 if not self.is_police else 1.3  # Police matches thief!
-                    self.speed = min(self.speed + self.acceleration_rate * accel_mult, self.max_speed)
-                elif best_action.speed_change == 'maintain':
-                    # Maintain current speed with aggressive drift toward max
-                    # AGGRESSIVE: Push toward max speed even when "maintaining"
-                    target_ratio = 0.98  # Both aim for near-max speed
-                    if self.speed < self.max_speed * target_ratio:
-                        # INCREASED from 0.35 to 0.80 for more aggressive speed maintenance
-                        self.speed = min(self.speed + self.acceleration_rate * 0.80, self.max_speed)
-                elif best_action.speed_change == 'brake':
-                    self.speed = max(self.speed - self.brake_rate, self.max_speed * 0.5)
+                # ===== SPECIAL ESCAPE MODE: When opponent is very close =====
+                if opponent and not self.is_police:
+                    distance_to_police = abs(opponent.distance - self.distance)
+                    if distance_to_police < 200:
+                        # THIEF PANIC MODE: Police very close - maximum aggression!
+                        if best_action.speed_change != 'brake':
+                            # Override to FULL SPEED acceleration
+                            self.speed = min(self.speed + self.acceleration_rate * 1.5, self.max_speed)
+                        else:
+                            # Even when braking, do it minimally to maintain speed
+                            self.speed = max(self.speed - self.brake_rate * 0.6, self.max_speed * 0.70)
+                    elif distance_to_police < 400:
+                        # THIEF ALERT MODE: Police approaching - high aggression
+                        if best_action.speed_change == 'accelerate':
+                            self.speed = min(self.speed + self.acceleration_rate * 1.4, self.max_speed)
+                        elif best_action.speed_change == 'maintain':
+                            # Push hard to max speed
+                            self.speed = min(self.speed + self.acceleration_rate * 1.2, self.max_speed)
+                        elif best_action.speed_change == 'brake':
+                            # Light braking only
+                            self.speed = max(self.speed - self.brake_rate * 0.7, self.max_speed * 0.65)
+                    else:
+                        # Normal execution when police is far
+                        if best_action.speed_change == 'accelerate':
+                            accel_mult = 1.3
+                            self.speed = min(self.speed + self.acceleration_rate * accel_mult, self.max_speed)
+                        elif best_action.speed_change == 'maintain':
+                            if self.speed < self.max_speed - 0.1:
+                                self.speed = min(self.speed + self.acceleration_rate * 1.0, self.max_speed)
+                        elif best_action.speed_change == 'brake':
+                            self.speed = max(self.speed - self.brake_rate, self.max_speed * 0.5)
+                else:
+                    # POLICE execution (unchanged) or no opponent
+                    if best_action.speed_change == 'accelerate':
+                        accel_mult = 1.3
+                        self.speed = min(self.speed + self.acceleration_rate * accel_mult, self.max_speed)
+                    elif best_action.speed_change == 'maintain':
+                        if self.speed < self.max_speed - 0.1:
+                            self.speed = min(self.speed + self.acceleration_rate * 1.0, self.max_speed)
+                    elif best_action.speed_change == 'brake':
+                        self.speed = max(self.speed - self.brake_rate, self.max_speed * 0.5)
         
         # ENFORCE 200 km/h SPEED LIMIT
         self.enforce_speed_limit()
@@ -2658,51 +3239,95 @@ class Vehicle:
         
         # ===== APPLY SMOOTH SPEED CHANGES =====
         if not self.crashed:
-            # STRONG ACCELERATION: Clear path, pedal to metal!
-            if acceleration > 0.3:
-                accel_multiplier = 1.4  # Both accelerate aggressively
-                self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
-            
-            # LIGHT ACCELERATION: Moderate speed increase
-            elif acceleration > 0.05:
-                accel_multiplier = 0.8  # Gentle acceleration
-                self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
-            
-            # STRONG BRAKE: Emergency or close obstacle
-            elif acceleration < -0.5:
-                self.speed = max(self.speed - self.brake_rate * 1.5, self.max_speed * 0.35)
-            
-            # LIGHT BRAKE: Caution or traffic ahead
-            elif acceleration < -0.15:
-                self.speed = max(self.speed - self.brake_rate * 0.8, self.max_speed * 0.55)
-            
-            # MAINTAIN/CRUISE: Smooth speed management
-            else:
-                # Set target speed based on road conditions
-                # AGGRESSIVE: Higher target speeds for better performance
-                if nearest_obstacle_dist > 600:
-                    target_speed = self.max_speed * 0.98  # Near max when clear (INCREASED from 0.96)
-                elif nearest_obstacle_dist > 400:
-                    target_speed = self.max_speed * 0.92  # High speed (INCREASED from 0.85)
-                elif nearest_obstacle_dist > 250:
-                    target_speed = self.max_speed * 0.82  # Good speed (INCREASED from 0.72)
-                else:
-                    target_speed = self.max_speed * 0.68  # Moderate (INCREASED from 0.58)
+            # ===== SPECIAL ESCAPE MODE for THIEF when police is close =====
+            if opponent and not self.is_police:
+                distance_to_police = abs(opponent.distance - self.distance)
                 
-                # Smooth transition to target speed with MORE AGGRESSIVE ACCELERATION
-                if self.speed < target_speed - 0.3:
-                    # INCREASED from 0.5 to 0.9 for faster speed recovery
-                    self.speed = min(self.speed + self.acceleration_rate * 0.9, self.max_speed)
-                elif self.speed > target_speed + 0.3:
-                    self.speed = max(self.speed - self.brake_rate * 0.4, target_speed)
+                if distance_to_police < 200:
+                    # PANIC ESCAPE: Police very close - override all logic!
+                    if acceleration >= 0:
+                        # Accelerate AGGRESSIVELY
+                        self.speed = min(self.speed + self.acceleration_rate * 1.8, self.max_speed)
+                    else:
+                        # Minimal braking only
+                        self.speed = max(self.speed - self.brake_rate * 0.5, self.max_speed * 0.75)
+                    
+                elif distance_to_police < 400:
+                    # HIGH ALERT: Boost all acceleration, reduce braking
+                    if acceleration > 0.3:
+                        accel_multiplier = 1.6  # Extra boost when escaping
+                        self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                    elif acceleration > 0.05:
+                        accel_multiplier = 1.2  # Increased from 0.8
+                        self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                    elif acceleration < -0.5:
+                        # Reduce braking intensity when escaping
+                        self.speed = max(self.speed - self.brake_rate * 1.0, self.max_speed * 0.50)
+                    elif acceleration < -0.15:
+                        self.speed = max(self.speed - self.brake_rate * 0.5, self.max_speed * 0.65)
+                    else:
+                        # Push to max speed when escaping
+                        target_speed = self.max_speed
+                        if self.speed < target_speed - 0.1:
+                            self.speed = min(self.speed + self.acceleration_rate * 1.3, self.max_speed)
+                else:
+                    # Normal execution when police is far - standard Minimax logic
+                    if acceleration > 0.3:
+                        accel_multiplier = 1.4
+                        self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                    elif acceleration > 0.05:
+                        accel_multiplier = 0.8
+                        self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                    elif acceleration < -0.5:
+                        self.speed = max(self.speed - self.brake_rate * 1.5, self.max_speed * 0.35)
+                    elif acceleration < -0.15:
+                        self.speed = max(self.speed - self.brake_rate * 0.8, self.max_speed * 0.55)
+                    else:
+                        if nearest_obstacle_dist > 600:
+                            target_speed = self.max_speed
+                        elif nearest_obstacle_dist > 400:
+                            target_speed = self.max_speed * 0.95
+                        elif nearest_obstacle_dist > 250:
+                            target_speed = self.max_speed * 0.85
+                        else:
+                            target_speed = self.max_speed * 0.70
+                        
+                        if self.speed < target_speed - 0.3:
+                            self.speed = min(self.speed + self.acceleration_rate * 1.0, self.max_speed)
+                        elif self.speed > target_speed + 0.3:
+                            self.speed = max(self.speed - self.brake_rate * 0.4, target_speed)
+            else:
+                # POLICE or no opponent - normal execution
+                if acceleration > 0.3:
+                    accel_multiplier = 1.4
+                    self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                elif acceleration > 0.05:
+                    accel_multiplier = 0.8
+                    self.speed = min(self.speed + self.acceleration_rate * accel_multiplier, self.max_speed)
+                elif acceleration < -0.5:
+                    self.speed = max(self.speed - self.brake_rate * 1.5, self.max_speed * 0.35)
+                elif acceleration < -0.15:
+                    self.speed = max(self.speed - self.brake_rate * 0.8, self.max_speed * 0.55)
+                else:
+                    if nearest_obstacle_dist > 600:
+                        target_speed = self.max_speed
+                    elif nearest_obstacle_dist > 400:
+                        target_speed = self.max_speed * 0.95
+                    elif nearest_obstacle_dist > 250:
+                        target_speed = self.max_speed * 0.85
+                    else:
+                        target_speed = self.max_speed * 0.70
+                    
+                    if self.speed < target_speed - 0.3:
+                        self.speed = min(self.speed + self.acceleration_rate * 1.0, self.max_speed)
+                    elif self.speed > target_speed + 0.3:
+                        self.speed = max(self.speed - self.brake_rate * 0.4, target_speed)
         
         # ===== PRIORITY #1: INTELLIGENT LANE SAFETY ANALYSIS =====
         # Analyze ALL lanes comprehensively to find the SAFEST one
         
         lane_safety_scores = {}
-        current_lane = fuzzy_controller.get_lane_from_x(self.x)
-        
-        # Speed-based safety margin (faster = need more space)
+        current_lane = fuzzy_controller.get_lane_from_x(self.x)        # Speed-based safety margin (faster = need more space)
         safety_margin = 250 + (self.speed * 35)
         emergency_distance = 200 + (self.speed * 25)
         
@@ -2856,8 +3481,12 @@ class Vehicle:
                                 if abs(car.distance - powerup.distance) < 80:
                                     immediate_danger = True
                     
-                    # ENHANCED: Fuzzy decision with higher priority on power-ups
+                    # ENHANCED: Fuzzy decision with power priority and lane safety
                     collection_score = 0
+                    
+                    # NEW: Base score from power priority system (balanced values)
+                    power_priority = powerup.get_priority_value()
+                    collection_score += power_priority * 30  # Scale priority to meaningful score
                     
                     # Factor 1: Distance to power-up (closer = better) - INCREASED VALUES!
                     if distance_to_powerup < 150:
@@ -2869,13 +3498,21 @@ class Vehicle:
                     else:
                         collection_score += 15  # INCREASED from 10
                     
-                    # Factor 2: Lane difference (same lane = much better) - INCREASED!
+                    # Factor 2: Lane difference with SAFETY CHECK
                     if lane_diff == 0:
-                        collection_score += 70  # INCREASED from 50
+                        collection_score += 70  # INCREASED from 50 - already in lane
                     elif lane_diff == 1:
-                        collection_score += 35  # INCREASED from 20
-                    else:
-                        collection_score += 15  # INCREASED from 5
+                        # Check if target lane is safe before adding score
+                        if self.is_lane_safe_for_powerup(powerup_lane, traffic_cars, lookahead=250):
+                            collection_score += 35  # Safe to switch
+                        else:
+                            collection_score -= 20  # Unsafe lane - heavy penalty
+                    else:  # lane_diff == 2
+                        # Two lanes away - must check intermediate safety
+                        if self.is_lane_safe_for_powerup(powerup_lane, traffic_cars, lookahead=250):
+                            collection_score += 15  # Safe but far
+                        else:
+                            collection_score -= 30  # Very unsafe - heavy penalty
                     
                     # Factor 3: Traffic risk (clear = better) - MORE LENIENT!
                     if immediate_danger:
@@ -2889,33 +3526,33 @@ class Vehicle:
                     else:
                         collection_score -= 10  # REDUCED penalty from -20
                     
-                    # Factor 4: Power-up value - CRITICAL FOR WINNING!
-                    if powerup.power_type == 'freeze':
-                        collection_score += 50  # GAME CHANGER!
-                    elif powerup.power_type == 'emp':
-                        collection_score += 45  # Very powerful
-                    elif powerup.power_type == 'shield':
-                        collection_score += 40  # Prevents crashes!
-                    elif powerup.power_type == 'ghost':
-                        collection_score += 40  # Pass through traffic!
-                    elif powerup.power_type == 'turbo':
-                        collection_score += 35  # Speed advantage
-                    else:
-                        collection_score += 25  # All powers are valuable!
+                    # Factor 4: Power-up value using PRIORITY SYSTEM (no longer hardcoded)
+                    # Priority already added above, but add situational bonuses
+                    # High-value defensive powers get extra boost
+                    if powerup.power_type in ['ghost', 'shield', 'emp', 'magnet']:
+                        collection_score += 20  # Bonus for high-priority powers
                     
                     # Factor 5: Opponent proximity - STRATEGIC NEED!
                     if opponent:
                         opponent_dist = opponent.distance - self.distance
                         if not self.is_police:
-                            # THIEF: Defensive powers when police close
-                            if opponent_dist < 400:  # Police approaching
+                            # THIEF: Defensive powers when police close - MASSIVELY INCREASED!
+                            if opponent_dist < 200:  # Police VERY close - CRITICAL!
                                 if powerup.power_type in ['freeze', 'shield', 'ghost']:
-                                    collection_score += 50  # INCREASED from 35 - CRITICAL!
-                                elif powerup.power_type == 'turbo':
-                                    collection_score += 40  # Escape faster!
+                                    collection_score += 100  # CRITICAL SURVIVAL!
+                                elif powerup.power_type == 'boost':
+                                    collection_score += 80  # Escape boost!
+                            elif opponent_dist < 400:  # Police approaching
+                                if powerup.power_type in ['freeze', 'shield', 'ghost']:
+                                    collection_score += 60  # INCREASED from 50
+                                elif powerup.power_type in ['boost', 'turbo']:
+                                    collection_score += 50  # Speed escape!
                         else:
                             # POLICE: Offensive powers to catch thief
-                            if opponent_dist < 500:  # Thief in range
+                            if opponent_dist < 300:  # Thief very close
+                                if powerup.power_type in ['emp', 'spike', 'magnet']:
+                                    collection_score += 70  # Catch opportunity!
+                            elif opponent_dist < 500:  # Thief in range
                                 if powerup.power_type in ['emp', 'turbo', 'magnet']:
                                     collection_score += 45  # INCREASED from 30 - ESSENTIAL!
                                 elif powerup.power_type == 'roadblock':
@@ -2926,8 +3563,17 @@ class Vehicle:
                         best_powerup_score = collection_score
                         best_powerup = (powerup, powerup_lane)
             
-            # EXECUTE: Go for best power-up if worth it - LOWERED THRESHOLD!
-            if best_powerup and best_powerup_score > 60:  # REDUCED from 70 - More aggressive!
+            # EXECUTE: Go for best power-up if worth it
+            # Dynamic threshold based on opponent proximity
+            collection_threshold = 60  # Default threshold
+            if opponent and not self.is_police:
+                opponent_dist = opponent.distance - self.distance
+                if opponent_dist < 200:
+                    collection_threshold = 40  # Very aggressive when police close!
+                elif opponent_dist < 400:
+                    collection_threshold = 50  # Aggressive when police approaching
+            
+            if best_powerup and best_powerup_score > collection_threshold:
                 powerup_lane = best_powerup[1]
                 if powerup_lane != current_lane:
                     # AGGRESSIVE steering toward power-up
@@ -3024,7 +3670,7 @@ class Vehicle:
                     goal_distance = current_distance + 900  # Move forward fast
                     
                 elif distance_to_thief > 200:
-                    # MEDIUM DISTANCE: AGGRESSIVE power-up collection for advantage!
+                    # MEDIUM DISTANCE: STRATEGIC power-up collection with priority system
                     # Look for police power-ups - CRITICAL FOR CATCHING THIEF!
                     closest_police_powerup = None
                     min_powerup_dist = float('inf')
@@ -3033,19 +3679,11 @@ class Vehicle:
                         if not powerup.collected and powerup.for_police:
                             dist_to_powerup = powerup.distance - current_distance
                             if 0 < dist_to_powerup < 900:  # INCREASED from 600 - Look further!
-                                # STRATEGIC: Prioritize game-changing powers
-                                priority_bonus = 0
+                                # Use PRIORITY SYSTEM instead of hardcoded values
+                                power_priority = powerup.get_priority_value()
                                 
-                                if powerup.power_type == 'turbo':
-                                    priority_bonus = -250  # Speed to catch thief!
-                                elif powerup.power_type == 'emp':
-                                    priority_bonus = -300  # Can disable thief!
-                                elif powerup.power_type == 'roadblock':
-                                    priority_bonus = -200  # Block thief's escape!
-                                elif powerup.power_type == 'magnet':
-                                    priority_bonus = -150  # Pull thief closer!
-                                else:
-                                    priority_bonus = -100  # All powers helpful!
+                                # Convert priority to distance reduction (higher priority = "closer" in decision)
+                                priority_bonus = -(power_priority * 200)  # Scale: 1.0-1.5 → -200 to -300
                                 
                                 effective_dist = dist_to_powerup + priority_bonus
                                 
@@ -3054,29 +3692,31 @@ class Vehicle:
                                     closest_police_powerup = powerup
                     
                     if closest_police_powerup:
-                        # Go for police power-up - MORE LENIENT safety check!
+                        # Go for police power-up with SAFETY CHECK
                         goal_distance = closest_police_powerup.distance
                         goal_lane = closest_police_powerup.lane
                         
-                        # Check if safe enough
-                        traffic_in_lane = 0
+                        # Use new lane safety method
+                        is_lane_safe = self.is_lane_safe_for_powerup(goal_lane, traffic_cars, lookahead=300)
+                        
+                        # Additional immediate danger check
                         immediate_danger = False
                         for car in traffic_cars:
                             if car.lane == goal_lane:
-                                dist_to_car = car.distance - current_distance
-                                if 0 < dist_to_car < 400:
-                                    traffic_in_lane += 1
-                                    if abs(car.distance - closest_police_powerup.distance) < 80:
-                                        immediate_danger = True
+                                if abs(car.distance - closest_police_powerup.distance) < 80:
+                                    immediate_danger = True
+                                    break
                         
-                        # Only skip if VERY dangerous
-                        if immediate_danger or traffic_in_lane > 5:  # INCREASED tolerance!
-                            # Too dangerous, use clear lane instead
-                            clearest_lane_info = astar_pathfinder.find_clearest_lane(
-                                current_distance, traffic_cars, look_ahead=700
-                            )
-                            goal_lane = clearest_lane_info[0]
-                            goal_distance = current_distance + 700
+                        # Only pursue if safe OR power-up is extremely valuable
+                        if immediate_danger or not is_lane_safe:
+                            # Too dangerous unless it's a critical power-up
+                            if closest_police_powerup.get_priority_value() < 1.3:  # Not high priority
+                                # Use clear lane instead
+                                clearest_lane_info = astar_pathfinder.find_clearest_lane(
+                                    current_distance, traffic_cars, look_ahead=700
+                                )
+                                goal_lane = clearest_lane_info[0]
+                                goal_distance = current_distance + 700
                         # Else: GO FOR IT! Powers are essential!
                         # Go for police power-up
                         goal_distance = closest_police_powerup.distance
@@ -3529,22 +4169,6 @@ class Vehicle:
             # Side mirrors
             pygame.draw.rect(screen, DARK_GRAY, (self.x - self.width//2 - 5, y_pos - 5, 5, 8))
             pygame.draw.rect(screen, DARK_GRAY, (self.x + self.width//2, y_pos - 5, 5, 8))
-        
-        # Label with better styling
-        font = pygame.font.Font(None, 24)
-        if self.is_player:
-            label = font.render("THIEF", True, WHITE)
-            # Label background
-            label_bg = pygame.Surface((label.get_width() + 10, label.get_height() + 6), pygame.SRCALPHA)
-            pygame.draw.rect(label_bg, (255, 0, 0, 180), label_bg.get_rect(), border_radius=5)
-            screen.blit(label_bg, (self.x - label.get_width()//2 - 5, y_pos - self.height//2 - 30))
-            screen.blit(label, (self.x - label.get_width()//2, y_pos - self.height//2 - 28))
-        elif self.is_police:
-            label = font.render("POLICE", True, WHITE)
-            label_bg = pygame.Surface((label.get_width() + 10, label.get_height() + 6), pygame.SRCALPHA)
-            pygame.draw.rect(label_bg, (0, 0, 255, 180), label_bg.get_rect(), border_radius=5)
-            screen.blit(label_bg, (self.x - label.get_width()//2 - 5, y_pos - self.height//2 - 30))
-            screen.blit(label, (self.x - label.get_width()//2, y_pos - self.height//2 - 28))
 
 class TrafficCar:
     def __init__(self, lane, distance):
@@ -4123,7 +4747,7 @@ def draw_road(screen, camera_offset):
             width = 4 + int((y / SCREEN_HEIGHT) * 2)
             pygame.draw.rect(screen, WHITE, (x - width//2, y, width, dash_height))
 
-def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0, shield_timer=0, ghost_timer=0, powerups_collected=0):
+def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0, shield_timer=0, ghost_timer=0, emp_timer=0, powerups_collected=0):
     """Enhanced HUD with TWO separate speed meters for Police and Thief"""
     # Top bar with gradient
     top_bar = pygame.Surface((SCREEN_WIDTH, 140), pygame.SRCALPHA)
@@ -4251,15 +4875,6 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
     distance_text = font_small.render(f"FINISH: {int(player_distance_left)}m", True, WHITE)
     screen.blit(distance_text, (SCREEN_WIDTH - 220, 85))
     
-    # ========== PREPARATION ZONE INDICATOR ==========
-    if player.distance < 1000:
-        # Show preparation zone message
-        prep_remaining = 1000 - player.distance
-        prep_text = font_small.render(f"🏁 PREP ZONE: {int(prep_remaining)}m", True, YELLOW)
-        screen.blit(prep_text, (SCREEN_WIDTH // 2 - 120, 20))
-        prep_info = font_tiny.render("(Traffic starts at 1000m)", True, (255, 200, 100))
-        screen.blit(prep_info, (SCREEN_WIDTH // 2 - 95, 45))
-    
     # Progress bar
     progress = player.distance / FINISH_LINE_DISTANCE
     progress_width = 180
@@ -4286,18 +4901,18 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
     active_powerup_y = powerup_y_start
     
     if freeze_timer > 0:
-        # Freeze power-up indicator
+        # Stagger Slow power-up indicator
         powerup_bg = pygame.Surface((70, 70), pygame.SRCALPHA)
         pygame.draw.rect(powerup_bg, (100, 200, 255, 200), powerup_bg.get_rect(), border_radius=10)
         screen.blit(powerup_bg, (powerup_x - 10, active_powerup_y - 10))
         
         freeze_font = pygame.font.Font(None, 48)
-        freeze_icon = freeze_font.render("❄️", True, WHITE)
+        freeze_icon = freeze_font.render("🌀", True, WHITE)
         screen.blit(freeze_icon, (powerup_x, active_powerup_y))
         
         # Timer bar
         timer_width = 60
-        timer_progress = (freeze_timer / 180) * timer_width
+        timer_progress = (freeze_timer / 150) * timer_width  # Updated to 2.5 seconds
         pygame.draw.rect(screen, (50, 50, 80), (powerup_x - 5, active_powerup_y + 55, timer_width, 8), border_radius=4)
         pygame.draw.rect(screen, (100, 200, 255), (powerup_x - 5, active_powerup_y + 55, int(timer_progress), 8), border_radius=4)
         
@@ -4315,7 +4930,7 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
         
         # Timer bar
         timer_width = 60
-        timer_progress = (boost_timer / 240) * timer_width
+        timer_progress = (boost_timer / 120) * timer_width  # Updated to 2 seconds
         pygame.draw.rect(screen, (80, 60, 0), (powerup_x - 5, active_powerup_y + 55, timer_width, 8), border_radius=4)
         pygame.draw.rect(screen, (255, 200, 0), (powerup_x - 5, active_powerup_y + 55, int(timer_progress), 8), border_radius=4)
         
@@ -4340,7 +4955,7 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
         active_powerup_y += 80
     
     if ghost_timer > 0:
-        # Ghost power-up indicator
+        # Ghost power-up indicator (now a counter, not a timer)
         powerup_bg = pygame.Surface((70, 70), pygame.SRCALPHA)
         pygame.draw.rect(powerup_bg, (200, 150, 255, 200), powerup_bg.get_rect(), border_radius=10)
         screen.blit(powerup_bg, (powerup_x - 10, active_powerup_y - 10))
@@ -4349,11 +4964,12 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
         ghost_icon = ghost_font.render("👻", True, WHITE)
         screen.blit(ghost_icon, (powerup_x, active_powerup_y))
         
-        # Timer bar
-        timer_width = 60
-        timer_progress = (ghost_timer / 300) * timer_width
-        pygame.draw.rect(screen, (60, 50, 80), (powerup_x - 5, active_powerup_y + 55, timer_width, 8), border_radius=4)
-        pygame.draw.rect(screen, (200, 150, 255), (powerup_x - 5, active_powerup_y + 55, int(timer_progress), 8), border_radius=4)
+        # Show "1 USE" text instead of timer bar
+        use_font = pygame.font.Font(None, 20)
+        use_text = use_font.render("1 USE", True, WHITE)
+        screen.blit(use_text, (powerup_x - 5, active_powerup_y + 55))
+        
+        active_powerup_y += 80
     
     # Police distance indicator
     distance_diff = abs(player.distance - police.distance)
@@ -4403,11 +5019,17 @@ def draw_hud(screen, player, police, traffic_cars, freeze_timer=0, boost_timer=0
         police_crash = police_crash_font.render("✓ Police Crashed!", True, GREEN)
         screen.blit(police_crash, (SCREEN_WIDTH // 2 - 80, 190))
     
-    # Freeze effect notification
+    # Stagger Slow effect notification
     if freeze_timer > 0:
         freeze_notif_font = pygame.font.Font(None, 32)
-        freeze_notif = freeze_notif_font.render("❄️ POLICE FROZEN!", True, (100, 200, 255))
-        screen.blit(freeze_notif, (SCREEN_WIDTH // 2 - 100, 220))
+        freeze_notif = freeze_notif_font.render("🌀 POLICE STAGGERED!", True, (100, 200, 255))
+        screen.blit(freeze_notif, (SCREEN_WIDTH // 2 - 120, 220))
+    
+    # EMP Stagger Slow effect notification
+    if emp_timer > 0:
+        emp_notif_font = pygame.font.Font(None, 32)
+        emp_notif = emp_notif_font.render("💫 THIEF STAGGERED!", True, (255, 100, 255))
+        screen.blit(emp_notif, (SCREEN_WIDTH // 2 - 120, 250))
 
 def draw_finish_line(screen, camera_offset, finish_distance):
     """Enhanced finish line with celebration effect"""
@@ -4473,6 +5095,9 @@ def show_start_screen(screen):
     waiting = True
     start_time = pygame.time.get_ticks()
     particles_bg = []
+    
+    # Start menu music
+    audio_manager.play_menu_music()
     
     # Create background particles for animation
     for _ in range(50):
@@ -5074,15 +5699,20 @@ def main():
         game_over = False
         winner = None
         
+        # Start game audio layers
+        audio_manager.play_game_music()
+        audio_manager.start_engine_layers()
+        audio_manager.start_traffic_ambient()
+        
         # Thief power-up timers
-        freeze_timer = 0
+        freeze_timer = 0  # Stagger Slow on police (40% speed reduction)
         boost_timer = 0
         shield_timer = 0
         ghost_timer = 0
         
         # Police power-up timers
         spike_timer = 0
-        emp_timer = 0
+        emp_timer = 0  # Stagger Slow on thief (30% speed reduction + steering difficulty)
         turbo_timer = 0
         roadblock_timer = 0
         magnet_timer = 0
@@ -5116,8 +5746,9 @@ def main():
                 player.shield_active = True
             else:
                 player.shield_active = False
+            # Ghost mode is now a counter (1 = has forgiveness, 0 = none)
+            # Don't count down automatically - only consumed on collision
             if ghost_timer > 0:
-                ghost_timer -= 1
                 player.ghost_mode = True
             else:
                 player.ghost_mode = False
@@ -5147,9 +5778,9 @@ def main():
             # Apply boost effect to thief's base speed
             speed_multiplier = 1.5 if boost_timer > 0 else 1.0
             
-            # EMP effect slows down thief
+            # EMP effect slows down thief (30% speed reduction)
             if emp_timer > 0:
-                speed_multiplier *= 0.5
+                speed_multiplier *= 0.7  # 30% speed reduction instead of 50%
             
             # Apply multiplier to thief's BASE speed (8.0)
             player.max_speed = player.base_max_speed * speed_multiplier
@@ -5168,6 +5799,13 @@ def main():
                 astar_pathfinder=thief_astar
             )
             
+            # Apply EMP steering difficulty (Stagger Slow effect)
+            if emp_timer > 0 and not player.crashed:
+                # Add random steering jitter to make control harder
+                if random.random() < 0.3:  # 30% chance each frame
+                    jitter_amount = random.randint(-3, 3)
+                    player.x = max(ROAD_X + 35, min(ROAD_X + ROAD_WIDTH - 35, player.x + jitter_amount))
+            
             # Add exhaust particles for thief
             if player.speed > 5 and random.random() < 0.3:
                 # Calculate screen position for particles
@@ -5183,6 +5821,14 @@ def main():
             player.wheel_rotation += player.speed
             player.update_crash()  # Update crash state
             
+            # Check for sharp steering (skid sound)
+            player.check_sharp_steering()
+            
+            # Update dynamic audio based on gameplay
+            audio_manager.update_engine_sound(player.speed, player.ABSOLUTE_MAX_SPEED)
+            police_distance = abs(police.distance - player.distance)
+            audio_manager.update_police_siren(police_distance)
+            
             # Check power-up collisions for THIEF
             player_screen_y = SCREEN_HEIGHT // 2
             for powerup in powerups:
@@ -5190,10 +5836,13 @@ def main():
                 if not powerup.for_police and powerup.check_collision(player.x, player_screen_y, player.width, player.height, camera_offset):
                     powerups_collected += 1
                     
+                    # Play powerup sound
+                    audio_manager.play_powerup()
+                    
                     # Apply thief power-up effect
                     if powerup.power_type == 'freeze':
-                        freeze_timer = 180  # 3 seconds at 60 FPS
-                        # Create freeze particle effect
+                        freeze_timer = 150  # 2.5 seconds at 60 FPS (Stagger Slow - 40% speed reduction)
+                        # Create stagger particle effect
                         for _ in range(30):
                             particles.append(Particle(
                                 police.x + random.randint(-30, 30),
@@ -5201,7 +5850,8 @@ def main():
                                 (100, 200, 255)
                             ))
                     elif powerup.power_type == 'boost':
-                        boost_timer = 240  # 4 seconds
+                        boost_timer = 120  # 2 seconds (reduced from 4 for tactical use)
+                        audio_manager.play_boost()  # Play boost sound
                         for _ in range(20):
                             particles.append(Particle(
                                 player.x + random.randint(-25, 25),
@@ -5217,7 +5867,7 @@ def main():
                                 (150, 255, 150)
                             ))
                     elif powerup.power_type == 'ghost':
-                        ghost_timer = 300  # 5 seconds
+                        ghost_timer = 1  # Ghost now provides 1 collision forgiveness (not a duration)
                         for _ in range(25):
                             particles.append(Particle(
                                 player.x + random.randint(-30, 30),
@@ -5241,7 +5891,7 @@ def main():
                                 (255, 50, 50)
                             ))
                     elif powerup.power_type == 'emp':
-                        emp_timer = 180  # 3 seconds - EMP slows thief's speed
+                        emp_timer = 150  # 2.5 seconds - Stagger Slow (30% speed reduction + steering difficulty)
                         for _ in range(30):
                             particles.append(Particle(
                                 player.x + random.randint(-40, 40),
@@ -5249,7 +5899,7 @@ def main():
                                 (255, 100, 255)
                             ))
                     elif powerup.power_type == 'turbo':
-                        turbo_timer = 300  # 5 seconds - police speed boost
+                        turbo_timer = 120  # 2 seconds - police speed boost (reduced from 5 for tactical use)
                         for _ in range(20):
                             particles.append(Particle(
                                 police.x + random.randint(-25, 25),
@@ -5278,14 +5928,16 @@ def main():
             for powerup in powerups:
                 powerup.update(camera_offset)
             
-            # Police AI using intelligent hybrid system with INDEPENDENT speed - affected by freeze power-up
-            if freeze_timer > 0:
-                # Police is frozen
-                police.speed = 0
-            elif not police.crashed:
+            # Police AI using intelligent hybrid system with INDEPENDENT speed - affected by Stagger Slow power-up
+            if not police.crashed:
                 # Apply turbo boost to police's BASE speed (8.5)
                 turbo_multiplier = 1.5 if turbo_timer > 0 else 1.0
-                police.max_speed = police.base_max_speed * turbo_multiplier
+                
+                # Apply Stagger Slow effect (40% speed reduction)
+                stagger_multiplier = 0.6 if freeze_timer > 0 else 1.0  # 40% reduction
+                
+                # Combine both multipliers
+                police.max_speed = police.base_max_speed * turbo_multiplier * stagger_multiplier
                 
                 # ===== STEP 2: PRIORITY DECISION HIERARCHY =====
                 # INTELLIGENT BLENDING of Fuzzy Logic, Minimax, and A* algorithms
@@ -5301,15 +5953,28 @@ def main():
                     astar_pathfinder=police_astar
                 )
             
-            # Apply magnet effect - pull thief toward police
+            # Apply magnet effect - pull thief toward police with distance-based scaling
             if magnet_timer > 0 and not player.crashed:
-                # Gradually pull thief toward police's x position
-                if abs(police.x - player.x) > 10:
-                    pull_strength = 2
-                    if police.x < player.x:
-                        player.x = max(ROAD_X + 35, player.x - pull_strength)
-                    else:
-                        player.x = min(ROAD_X + ROAD_WIDTH - 35, player.x + pull_strength)
+                # Calculate distance between police and thief
+                distance_apart = abs(police.distance - player.distance)
+                
+                # Magnet strength scales with distance: strong when close, weak when far
+                # Formula: pull_force = clamp((350 - distance) / 350, 0, 1)
+                max_magnet_range = 350
+                if distance_apart < max_magnet_range:
+                    # Calculate normalized pull force (0.0 to 1.0)
+                    pull_force = max(0.0, min(1.0, (max_magnet_range - distance_apart) / max_magnet_range))
+                    
+                    # Base pull strength varies from 0.5 to 4.0 based on distance
+                    pull_strength = 0.5 + (pull_force * 3.5)
+                    
+                    # Gradually pull thief toward police's x position
+                    if abs(police.x - player.x) > 10:
+                        if police.x < player.x:
+                            player.x = max(ROAD_X + 35, player.x - pull_strength)
+                        else:
+                            player.x = min(ROAD_X + ROAD_WIDTH - 35, player.x + pull_strength)
+                # If distance > 350, no magnet effect (too far)
             
             # Apply spike effect - slow down thief
             if spike_timer > 0 and not player.crashed:
@@ -5318,15 +5983,15 @@ def main():
             police.distance += police.speed
             police.update_crash()  # Update crash state
             
-            # Add police exhaust (with freeze effect)
+            # Add police exhaust (with stagger slow effect)
             if freeze_timer > 0:
-                # Frozen police - show ice particles
+                # Staggered police - show disorientation particles
                 if random.random() < 0.3:
                     police_screen_y = police.distance - camera_offset + SCREEN_HEIGHT // 2
                     particles.append(Particle(
                         police.x + random.randint(-20, 20),
                         police_screen_y + random.randint(-20, 20),
-                        (150, 220, 255)
+                        (100, 200, 255)
                     ))
             elif random.random() < 0.2:
                 # Calculate screen position for particles
@@ -5351,6 +6016,7 @@ def main():
                     if abs(player.distance - roadblock_distance) < 100:
                         # Hit the roadblock!
                         player.crash()
+                        audio_manager.play_crash()  # Crash sound
                         for _ in range(20):
                             particles.append(Particle(
                                 player.x + random.randint(-30, 30),
@@ -5360,21 +6026,22 @@ def main():
             
             # Check collisions with traffic cars
             for car in traffic_cars:
-                # Check player collision with traffic (ghost mode allows pass-through)
-                if not player.crashed and ghost_timer <= 0:
+                # Check player collision with traffic
+                if not player.crashed:
                     player_dist = math.sqrt((player.x - car.x)**2 + (player.distance - car.distance)**2)
                     if player_dist < 55:  # Collision threshold
-                        # Shield protects from crashes
-                        if shield_timer <= 0:
-                            player.crash()
-                            # Create crash effect particles
-                            for _ in range(15):
+                        # Ghost mode forgives 1 collision
+                        if ghost_timer > 0:
+                            ghost_timer = 0  # Consume ghost forgiveness
+                            # Create ghost effect particles
+                            for _ in range(20):
                                 particles.append(Particle(
-                                    player.x + random.randint(-25, 25),
-                                    SCREEN_HEIGHT // 2 + random.randint(-25, 25),
-                                    random.choice([ORANGE, YELLOW, RED])
+                                    player.x + random.randint(-30, 30),
+                                    SCREEN_HEIGHT // 2 + random.randint(-30, 30),
+                                    (200, 150, 255)
                                 ))
-                        else:
+                        # Shield protects from crashes
+                        elif shield_timer > 0:
                             # Shield absorbed the hit - create shield spark effect
                             for _ in range(10):
                                 particles.append(Particle(
@@ -5382,12 +6049,24 @@ def main():
                                     SCREEN_HEIGHT // 2 + random.randint(-25, 25),
                                     (150, 255, 150)
                                 ))
+                        else:
+                            # No protection - crash!
+                            player.crash()
+                            audio_manager.play_crash()  # Crash sound
+                            # Create crash effect particles
+                            for _ in range(15):
+                                particles.append(Particle(
+                                    player.x + random.randint(-25, 25),
+                                    SCREEN_HEIGHT // 2 + random.randint(-25, 25),
+                                    random.choice([ORANGE, YELLOW, RED])
+                                ))
                 
                 # Check police collision with traffic
                 if not police.crashed:
                     police_dist = math.sqrt((police.x - car.x)**2 + (police.distance - car.distance)**2)
                     if police_dist < 55:  # Collision threshold
                         police.crash()
+                        audio_manager.play_crash()  # Crash sound
                         # Create crash effect particles
                         for _ in range(15):
                             police_screen_y = police.distance - camera_offset + SCREEN_HEIGHT // 2
@@ -5427,6 +6106,8 @@ def main():
                 # Police caught the thief!
                 game_over = True
                 winner = "police"
+                audio_manager.stop_all_sounds()
+                audio_manager.play_lose_music()
             
             # CRITICAL: Prevent police from overtaking without catching
             # If police is ahead or equal to thief, game should end
@@ -5434,11 +6115,15 @@ def main():
                 # Police has reached/overtaken thief - this counts as caught
                 game_over = True
                 winner = "police"
+                audio_manager.stop_all_sounds()
+                audio_manager.play_lose_music()
             
             # Check if player reached finish
             if player.distance >= FINISH_LINE_DISTANCE:
                 game_over = True
                 winner = "thief"
+                audio_manager.stop_all_sounds()
+                audio_manager.play_win_music()
             
             # === DRAWING ===
             # Background scenery
@@ -5465,12 +6150,62 @@ def main():
             for car in traffic_cars:
                 car.draw(screen, camera_offset)
             
+            # Draw roadblock with warning indicator
+            if roadblock_timer > 0 and roadblock_lane >= 0:
+                roadblock_x = ROAD_X + roadblock_lane * LANE_WIDTH + LANE_WIDTH // 2
+                roadblock_distance = player.distance + 300
+                roadblock_screen_y = SCREEN_HEIGHT // 2 - (roadblock_distance - camera_offset)
+                
+                # Warning phase: 0.7 seconds = 42 frames (show warning if timer > 378)
+                WARNING_THRESHOLD = 420 - 42  # Show warning for first 42 frames
+                
+                if roadblock_timer > WARNING_THRESHOLD:
+                    # Draw warning indicator (flashing)
+                    if (roadblock_timer // 5) % 2 == 0:  # Flash effect
+                        # Warning triangle above roadblock position
+                        warning_size = 40
+                        warning_y = roadblock_screen_y - 100
+                        
+                        # Yellow warning triangle
+                        pygame.draw.polygon(screen, YELLOW, [
+                            (roadblock_x, warning_y - warning_size // 2),
+                            (roadblock_x - warning_size // 2, warning_y + warning_size // 2),
+                            (roadblock_x + warning_size // 2, warning_y + warning_size // 2)
+                        ])
+                        pygame.draw.polygon(screen, ORANGE, [
+                            (roadblock_x, warning_y - warning_size // 2),
+                            (roadblock_x - warning_size // 2, warning_y + warning_size // 2),
+                            (roadblock_x + warning_size // 2, warning_y + warning_size // 2)
+                        ], 3)
+                        
+                        # Exclamation mark
+                        warning_font = pygame.font.Font(None, 32)
+                        warning_text = warning_font.render("!", True, BLACK)
+                        screen.blit(warning_text, (roadblock_x - 6, warning_y - 10))
+                else:
+                    # Draw actual roadblock
+                    if -100 < roadblock_screen_y < SCREEN_HEIGHT + 100:
+                        # Red barrier
+                        barrier_width = LANE_WIDTH - 40
+                        barrier_height = 80
+                        pygame.draw.rect(screen, RED, 
+                                       (roadblock_x - barrier_width // 2, roadblock_screen_y - barrier_height // 2,
+                                        barrier_width, barrier_height), border_radius=10)
+                        pygame.draw.rect(screen, (255, 150, 150), 
+                                       (roadblock_x - barrier_width // 2, roadblock_screen_y - barrier_height // 2,
+                                        barrier_width, barrier_height), 3, border_radius=10)
+                        
+                        # Roadblock icon
+                        roadblock_font = pygame.font.Font(None, 48)
+                        roadblock_icon = roadblock_font.render("🚧", True, WHITE)
+                        screen.blit(roadblock_icon, (roadblock_x - 20, roadblock_screen_y - 20))
+            
             # Police and player
             police.draw(screen, camera_offset)
             player.draw(screen, camera_offset)
             
             # HUD (drawn last to be on top)
-            draw_hud(screen, player, police, traffic_cars, freeze_timer, boost_timer, shield_timer, ghost_timer, powerups_collected)
+            draw_hud(screen, player, police, traffic_cars, freeze_timer, boost_timer, shield_timer, ghost_timer, emp_timer, powerups_collected)
             
             pygame.display.flip()
         
